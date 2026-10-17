@@ -1,0 +1,5 @@
+// Shared signing settings. Do not put your Team ID here.
+// Run `python3 scripts/setup.py` (or copy Local.xcconfig.example to Local.xcconfig)
+// to set your own Apple development team and a unique bundle identifier.
+XIAOLU_WATCH_BUNDLE_ID = com.example.xiaoluwatch
+#include? "Local.xcconfig"

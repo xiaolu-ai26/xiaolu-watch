@@ -1,0 +1,30 @@
+# Runtime data: secrets, original audio, databases, transcripts, notes outbox, logs, models
+/data/
+*.sqlite3
+*.log
+private/
+onboarding.json
+watch-pairing-card.txt
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Apple build output and personal signing
+apple/WatchMemory/Config/Local.xcconfig
+apple/WatchMemory/*.xcodeproj/
+apple/WatchMemory/.build/
+apple/WatchMemory/.swiftpm/
+DerivedData/
+build/
+*.ipa
+*.mobileprovision
+*.p12
+*.cer
+xcuserdata/
+
+# OS / editors
+.DS_Store
+.idea/
+.vscode/

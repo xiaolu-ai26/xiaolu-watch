@@ -1,0 +1,3 @@
+# Local speech recognition on the receiver computer (not needed on a notes-sync-only Mac).
+# NVIDIA GPU: also needs CUDA 12 cuBLAS + cuDNN 9 runtime libraries, see docs/deployment.md.
+faster-whisper>=1.1       # MIT (pulls in ctranslate2 MIT, huggingface_hub Apache-2.0, tokenizers Apache-2.0, av BSD)

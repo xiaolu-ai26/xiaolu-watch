@@ -1,0 +1,4 @@
+# Receiver + pipeline core (all platforms). Install into a virtualenv:
+#   python3 -m venv .venv && .venv/bin/pip install -r requirements.txt     (Windows: .venv\Scripts\pip)
+cryptography>=42          # Apache-2.0 OR BSD-3-Clause; AES-GCM / HKDF / HMAC for the sealed v2 protocol
+tzdata; sys_platform == "win32"   # Apache-2.0; IANA time zones for zoneinfo on Windows

@@ -1,0 +1,10 @@
+# The only secret-looking values in this repository are deterministic PUBLIC test fixtures:
+#   AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8  = base64url(bytes 0..31)
+#   QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkI  = base64url("B" * 32), used as a wrong key
+# They are never valid for a real pairing; real secrets are generated into data/ (git-ignored).
+[extend]
+useDefault = true
+
+[allowlist]
+description = "public deterministic protocol test fixtures"
+regexes = ['''AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8''', '''QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkI''']
