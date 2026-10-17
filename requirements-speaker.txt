@@ -1,0 +1,7 @@
+# Install only in an isolated speaker environment; no changes to ASR Python/Torch.
+# GPU ORT: CUDA 12.x and cuDNN 9 runtime DLLs must be available to this process.
+# Use configured cuda_dll_dirs or the official ORT runtime setup; do not mix
+# onnxruntime and onnxruntime-gpu in one environment. Weights are separate CC-BY-4.0.
+onnxruntime-gpu==1.23.2
+kaldi-native-fbank==1.22.3
+numpy==2.5.4

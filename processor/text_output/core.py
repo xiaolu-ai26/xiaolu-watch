@@ -44,6 +44,7 @@ class Source:
     text_hash: str
     asr_model: str = ''
     receipt_hash: str = ''
+    segments: tuple = ()
 
     def identity(self):
         return {k: getattr(self, k) for k in ('source_id', 'session', 'sequence', 'date', 'captured', 'duration', 'text_hash', 'asr_model', 'receipt_hash')}
@@ -106,7 +107,8 @@ def discover(asr_root, sessions_root, capture_since=None, derived_asr_root=None,
                 text = '\n'.join(s['text'].strip() for s in raw['segments']).strip()
                 if len(text) > 100_000:
                     raise ValueError('single transcript too large')
-                item = Source(source_id, session, seq, date, timestamp.timestamp(), float(m['duration_s']), text, digest(text), str(raw.get('model', '')), hashlib.sha256(receipt.read_bytes()).hexdigest())
+                segments = tuple({'text': s['text'], 'start': s.get('start'), 'end': s.get('end')} for s in raw['segments'])
+                item = Source(source_id, session, seq, date, timestamp.timestamp(), float(m['duration_s']), text, digest(text), str(raw.get('model', '')), hashlib.sha256(receipt.read_bytes()).hexdigest(), segments)
         group[seq] = item
     return groups
 

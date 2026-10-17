@@ -115,6 +115,7 @@ docs/                部署、App 编译安装、排障、加密协议
 
 - [docs/deployment.md](docs/deployment.md)：两种接收端的部署、HTTPS 入口、后台服务、显卡、存储与回滚
 - [docs/dual-text-output.md](docs/dual-text-output.md)：可选口语清稿、七删一改、DeepSeek 费用边界与双版本输出
+- [docs/conversation-owner.md](docs/conversation-owner.md)：自然对话分组与本地本人声音识别的实现边界、隐私和验收说明
 - [docs/apple-build.md](docs/apple-build.md)：编译安装手表 App、首次配对
 - [docs/troubleshooting.md](docs/troubleshooting.md)：Xcode 连不上手表、VPN 冲突等真实踩坑
 - [docs/wire-v2.md](docs/wire-v2.md)：加密上传协议 v2

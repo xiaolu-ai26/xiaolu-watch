@@ -12,7 +12,9 @@ import math
 from pathlib import Path
 import time
 
-from text_output.core import NOTE_SCOPES, batch_identity, daily_markdown, discover, next_batch
+from text_output.core import NOTE_SCOPES, batch_identity, daily_markdown, discover, next_batch, digest
+from text_output.conversation import GROUP_SCHEMA, choose_window, utterances, materialize
+from text_output.speaker_labels import attach as attach_speaker_labels
 from text_output.lark_output import Lark
 from text_output.provider import DeepSeek
 from text_output.store import State, TokenBudgetExceeded, atomic, singleton
@@ -39,6 +41,9 @@ class Worker:
             raise ValueError('state and reader-facing output must be separate')
         self.home.mkdir(parents=True, exist_ok=True)
         self.state = State(self.home / 'state.sqlite3')
+        self.conversation_mode = config.get('conversation_mode', False)
+        if type(self.conversation_mode) is not bool:
+            raise ValueError('conversation_mode must be a boolean')
         self.provider = provider or DeepSeek(config['provider'], self.state)
         self.publisher = publisher or (Lark(self.state, self.home) if config.get('feishu') is True else None)
 
@@ -111,7 +116,7 @@ class Worker:
         for _, batch in self.state.items('batch:'):
             if batch.get('output') and self._eligible(batch) and (not batch.get('published') or not self.publisher):
                 self._publish(batch)
-        completed = 0
+        completed = 0; speaker_waiting = 0; unknown_units = 0; speaker_reasons = {}
         for (date, session), slots in sorted(groups.items()):
             cursor_key = 'consumed:' + date + ':' + session
             consumed = set(self.state.get(cursor_key, [])) if since is None else set()
@@ -125,13 +130,19 @@ class Worker:
             if since is not None:
                 consumed.update(seq for seq, item in slots.items() if item is not None and item.captured < since)
             self.state.put(cursor_key, sorted(consumed))
-            rows = next_batch(slots, consumed, now,
-                              max_seconds=int(self.config.get('batch_seconds', 300)),
-                              max_chars=int(self.config.get('batch_chars', 3500)),
-                              tail_seconds=int(self.config.get('tail_seconds', 180)), floor=floor)
+            window_args = {'max_seconds': int(self.config.get('batch_seconds', 300)),
+                           'max_chars': int(self.config.get('batch_chars', 3500)),
+                           'tail_seconds': int(self.config.get('tail_seconds', 180)), 'floor': floor}
+            if self.conversation_mode:
+                rows = choose_window(slots, consumed, now, pause_seconds=self.config.get('conversation_pause_seconds', 12), **window_args)
+            else:
+                rows = next_batch(slots, consumed, now, **window_args)
             if not rows:
                 continue
-            identity = batch_identity(rows); key = 'batch:' + identity
+            identity = batch_identity(rows)
+            if self.conversation_mode:
+                identity = digest({'source_batch': identity, 'schema': GROUP_SCHEMA})
+            key = 'batch:' + identity
             batch = self.state.get(key, {'id': identity, 'date': date, 'session': session,
                     'sequence': rows[0].sequence, 'sequences': [r.sequence for r in rows], 'captured': rows[0].captured,
                     'sources': [r.identity() for r in rows], 'attempts': 0})
@@ -144,11 +155,34 @@ class Worker:
                 continue
             previous = [b for b in self._saved_batches(date) if b['session'] == session and b['sequence'] < rows[0].sequence]
             context = previous[-1]['raw_tail'] if previous else ''
+            units = []; conversation_previous = None; speaker_state = None
+            if self.conversation_mode:
+                units = utterances(rows)
+                if len(units) > 400:
+                    raise ValueError('conversation utterance window too large')
+                speaker_state = attach_speaker_labels(units, rows, self.config.get('speaker', {}), self.state, now)
+                unknown_units += speaker_state['unknown_units']
+                reasons = list(speaker_state.get('reasons', {}).values()) or [speaker_state.get('reason', 'speaker_unknown')]
+                for reason in reasons:
+                    speaker_reasons[reason] = speaker_reasons.get(reason, 0) + 1
+                if speaker_state['waiting']:
+                    speaker_waiting += 1
+                    continue
+                earlier = [b for b in self._saved_batches(date) if b.get('conversation_groups') and b['captured'] <= rows[0].captured]
+                if earlier:
+                    prior = earlier[-1]
+                    conversation_previous = prior['conversation_groups'][-1]
+                    context = prior['raw_tail']
             # Persist the attempt before network I/O; crashes count toward the retry ceiling too.
             batch.update(attempts=batch['attempts'] + 1, retry_after=now + 600)
             self.state.put(key, batch)
             try:
-                output, provenance = self.provider.edit(rows, context)
+                if self.conversation_mode:
+                    grouped, provenance = self.provider.edit_conversations(rows, units, conversation_previous, context)
+                    output, group_sidecar = materialize(grouped, units, identity, conversation_previous)
+                    batch.update(conversation_schema=GROUP_SCHEMA, conversation_groups=group_sidecar, speaker=speaker_state)
+                else:
+                    output, provenance = self.provider.edit(rows, context)
                 batch.update(output=output, provider=provenance, raw_tail=''.join(r.text for r in rows)[-600:], generated_at=time.time(), last_error=None)
                 self.state.put(key, batch)
                 self.state.put(cursor_key, sorted(consumed | {r.sequence for r in rows}))
@@ -168,7 +202,9 @@ class Worker:
         blocked = [{'batch': b['id'], 'reason': b.get('last_error'), 'attempts': b.get('attempts'),
                     'retry_after': b.get('retry_after')} for _, b in self.state.items('batch:')
                    if not b.get('output') and b.get('last_error') and self._eligible(b)]
-        return {'new_batches': completed, 'days': len({k[0] for k in groups}), 'blocked_batches': blocked}
+        return {'new_batches': completed, 'days': len({k[0] for k in groups}), 'blocked_batches': blocked,
+                'speaker_waiting_windows': speaker_waiting, 'speaker_unknown_units': unknown_units,
+                'speaker_reasons': speaker_reasons, 'conversation_mode': self.conversation_mode}
 
 
 def main():
