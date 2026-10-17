@@ -43,6 +43,7 @@ NOTES_ROOT = HOME / 'notes'
 NOTES = NOTES_ROOT / NOTE_DIR
 FEISHU = False
 WRITE_MANIFEST = False
+PUBLISH_OUTPUTS = True
 TZ = ZoneInfo('Asia/Shanghai')
 ASR = {}
 _processor = None
@@ -50,12 +51,15 @@ _processor = None
 
 def configure(settings, home):
     """Apply settings.json values to module state. Paths in settings are absolute."""
-    global HOME, RECEIVER_INBOX, NOTES_ROOT, NOTES, FEISHU, WRITE_MANIFEST, TZ, ASR, _processor
+    global HOME, RECEIVER_INBOX, NOTES_ROOT, NOTES, FEISHU, WRITE_MANIFEST, PUBLISH_OUTPUTS, TZ, ASR, _processor
     HOME = Path(home).resolve()
     RECEIVER_INBOX = Path(settings.get('receiver', {}).get('root') or HOME / 'receiver') / 'inbox'
     NOTES_ROOT = Path(settings['notes']['dir'])
     NOTES = NOTES_ROOT / NOTE_DIR
-    FEISHU = bool(settings.get('feishu', {}).get('enabled', False))
+    PUBLISH_OUTPUTS = settings['notes'].get('publish_outputs', True)
+    if not isinstance(PUBLISH_OUTPUTS, bool):
+        raise ValueError('notes.publish_outputs must be boolean')
+    FEISHU = bool(settings.get('feishu', {}).get('enabled', False)) and PUBLISH_OUTPUTS
     WRITE_MANIFEST = bool(settings['notes'].get('manifest', False))
     TZ = ZoneInfo(settings.get('timezone') or 'Asia/Shanghai')
     ASR = dict(settings.get('asr', {}))
@@ -399,6 +403,13 @@ def process(db, path, capture_date, is_test=False, source_url=None, no_lark=None
         if receipt.get('is_test') is not is_test or receipt.get('source_url') != source_url or receipt.get('capture_date_basis') != date_basis:
             raise RuntimeError('ASR receipt test/source/date-basis mismatch; refuse provenance substitution')
         segments = segments_of(receipt, dest)
+        if not PUBLISH_OUTPUTS:
+            job.update(status='done' if segments else 'no_speech', remote_done=True,
+                       output_policy='asr_only', publication_status='disabled', lark_verified=False,
+                       note_path=None, last_error=None)
+            save(db, key, job)
+            atomic_json(dest / 'client-receipt.json', job)
+            return job
         if app_metadata is not None and not segments:
             job.update(status='no_speech', note_path=None, last_error=None, consumed=True,
                        processing_result='No speech segments; raw audio and App event metadata retained, no empty note created')

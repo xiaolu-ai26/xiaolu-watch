@@ -8,7 +8,7 @@ follows symlinks and never overwrites a note you edited (it is reported as a con
 
     python3 processor/sync_notes.py            # uses data/settings.json -> "mac_sync"
 """
-import argparse,datetime as dt,hashlib,json,os,stat,subprocess,sys,tempfile,uuid
+import argparse,datetime as dt,hashlib,json,os,re,stat,subprocess,sys,tempfile,uuid
 from pathlib import Path,PurePosixPath
 
 REPO=Path(__file__).resolve().parent.parent
@@ -32,10 +32,14 @@ def ssh_options(config):
     if config.get('ssh_config'):options=['-F',str(config['ssh_config'])]+options
     return options
 
-def safe_relative(raw):
+LEGACY_SCOPES=('录音资料','飞书修订快照')
+DUAL_SCOPES=('口语清稿','七删一改整理稿')
+
+def safe_relative(raw,allowed_scopes=LEGACY_SCOPES):
     if not isinstance(raw,str) or '\\' in raw or ':' in raw or any(ord(c)<32 or ord(c)==127 for c in raw):raise ValueError('ambiguous outbox path')
     p=PurePosixPath(raw)
-    if p.is_absolute() or len(p.parts)!=2 or p.parts[0] not in ['录音资料','飞书修订快照'] or p.suffix!='.md' or any(x in ['.','..'] for x in p.parts):raise ValueError('outbox path outside scoped project')
+    if p.is_absolute() or len(p.parts)!=2 or p.parts[0] not in allowed_scopes or p.suffix!='.md' or any(x in ['.','..'] for x in p.parts):raise ValueError('outbox path outside scoped project')
+    if allowed_scopes==DUAL_SCOPES and not re.fullmatch(r'\d{4}-\d{2}-\d{2}_'+re.escape(p.parts[0])+r'\.md',p.name):raise ValueError('unexpected dual note name')
     return p
 
 class AnchoredVault:
@@ -77,20 +81,27 @@ def existing_hash(fd,name):
         return digest.hexdigest()
     finally:os.close(handle)
 
-def publish(anchored,fd,name,source,expected):
+def publish(anchored,fd,name,source,expected,replace_expected=None):
     anchored.validate();old=existing_hash(fd,name)
-    if old is not None:return 'same' if old==expected else 'conflict'
-    temp='.xiaolu-sync-'+uuid.uuid4().hex
+    if old==expected:return 'same'
+    if old is not None and old!=replace_expected:return 'conflict'
+    temp='.omen-sync-'+uuid.uuid4().hex
     handle=os.open(temp,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600,dir_fd=fd)
     try:
         with os.fdopen(handle,'wb') as dst,source.open('rb') as src:
             for block in iter(lambda:src.read(1024*1024),b''):dst.write(block)
             dst.flush();os.fsync(dst.fileno())
         anchored.validate()
+        if old is not None:
+            if existing_hash(fd,name)!=replace_expected:return 'conflict'
+            os.rename(temp,name,src_dir_fd=fd,dst_dir_fd=fd)
+            os.fsync(fd);return 'updated'
         try:os.link(temp,name,src_dir_fd=fd,dst_dir_fd=fd,follow_symlinks=False)
         except FileExistsError:return 'same' if existing_hash(fd,name)==expected else 'conflict'
         os.fsync(fd);return 'copied'
-    finally:os.unlink(temp,dir_fd=fd)
+    finally:
+        try:os.unlink(temp,dir_fd=fd)
+        except FileNotFoundError:pass
 
 def remote(config,relative):
     base=str(config['remote_notes_dir']).replace('\\','/').rstrip('/')
@@ -107,27 +118,54 @@ def main():
     if not destination.is_absolute():raise ValueError('Vault destination must be absolute')
     if not destination.is_dir():raise SystemExit(f'Destination folder does not exist: {destination}')
     scp=['scp','-q']+ssh_options(config)
-    with tempfile.TemporaryDirectory(prefix='xiaolu-watch-pull-') as td:
-        listing=Path(td)/'manifest.json'
-        run(scp+[remote(config,'manifest.json'),str(listing)],timeout=30)
-        manifest=json.loads(listing.read_text(encoding='utf-8'))
-    if manifest.get('version')!=1 or not isinstance(manifest.get('files'),list):raise ValueError('unsupported outbox manifest')
-    copied=[];conflicts=[]
+    state_path=args.home/'state'/'mac-sync.json'
+    previous=json.loads(state_path.read_text(encoding='utf-8')) if state_path.exists() else {}
+    managed=previous.get('managed_dual_hashes',{})
+    pending=previous.get('pending_dual',{})
+    sources=[(config,LEGACY_SCOPES)]
+    if config.get('remote_dual_text_dir'):
+        sources.append((dict(config,remote_notes_dir=config['remote_dual_text_dir']),DUAL_SCOPES))
+    copied=[];conflicts=[];total=0
     with AnchoredVault(destination) as anchor:
-        for item in manifest['files']:
-            rel=safe_relative(item['relative_path']);expected=item['sha256'];size=item['bytes']
-            if len(expected)!=64 or any(x not in '0123456789abcdef' for x in expected) or type(size) is not int or not 0<size<=16*1024**2:raise ValueError('invalid outbox identity')
-            fd=anchor.child(rel.parts[0]);old=existing_hash(fd,rel.name)
-            if old is not None:
-                if old!=expected:conflicts.append(str(rel))
-                continue
+        for source,scopes in sources:
             with tempfile.TemporaryDirectory(prefix='xiaolu-watch-pull-') as td:
-                tmp=Path(td)/'note.md'
-                run(scp+[remote(config,str(rel)),str(tmp)],timeout=60)
-                if tmp.stat().st_size!=size or hashlib.sha256(tmp.read_bytes()).hexdigest()!=expected:raise ValueError('note identity mismatch')
-                result=publish(anchor,fd,rel.name,tmp,expected)
-                if result=='copied':copied.append(str(rel))
-                elif result=='conflict':conflicts.append(str(rel))
-    atomic_json(args.home/'state'/'mac-sync.json',{'checked_at':now(),'copied':copied,'conflicts_preserved':conflicts,'remote_file_count':len(manifest['files']),'status':'conflict' if conflicts else 'synced'})
+                listing=Path(td)/'manifest.json'
+                run(scp+[remote(source,'manifest.json'),str(listing)],timeout=30)
+                manifest=json.loads(listing.read_text(encoding='utf-8'))
+            if manifest.get('version')!=1 or not isinstance(manifest.get('files'),list) or (scopes==DUAL_SCOPES and manifest.get('kind')!='dual-text'):raise ValueError('unsupported outbox manifest')
+            total+=len(manifest['files'])
+            for item in manifest['files']:
+                rel=safe_relative(item['relative_path'],scopes);expected=item['sha256'];size=item['bytes']
+                if len(expected)!=64 or any(x not in '0123456789abcdef' for x in expected) or type(size) is not int or not 0<size<=16*1024**2:raise ValueError('invalid outbox identity')
+                fd=anchor.child(rel.parts[0]);old=existing_hash(fd,rel.name)
+                if scopes==DUAL_SCOPES and str(rel) in pending:
+                    intent=pending[str(rel)]
+                    if old==intent['new']:
+                        managed[str(rel)]=intent['new'];pending.pop(str(rel))
+                    elif old==intent['old']:
+                        pending.pop(str(rel))
+                    else:
+                        conflicts.append(str(rel));continue
+                if old==expected:
+                    if scopes==DUAL_SCOPES:managed[str(rel)]=expected
+                    continue
+                prior=managed.get(str(rel)) if scopes==DUAL_SCOPES else None
+                if old is not None and (prior is None or old!=prior):
+                    conflicts.append(str(rel));continue
+                with tempfile.TemporaryDirectory(prefix='xiaolu-watch-pull-') as td:
+                    tmp=Path(td)/'note.md'
+                    run(scp+[remote(source,str(rel)),str(tmp)],timeout=60)
+                    if tmp.stat().st_size!=size or hashlib.sha256(tmp.read_bytes()).hexdigest()!=expected:raise ValueError('note identity mismatch')
+                    if scopes==DUAL_SCOPES:
+                        pending[str(rel)]={'old':prior,'new':expected}
+                        atomic_json(state_path,{'checked_at':now(),'managed_dual_hashes':managed,'pending_dual':pending,'status':'syncing'})
+                    result=publish(anchor,fd,rel.name,tmp,expected,prior)
+                    if result in ('copied','updated'):
+                        copied.append(str(rel))
+                        if scopes==DUAL_SCOPES:
+                            managed[str(rel)]=expected;pending.pop(str(rel),None)
+                            atomic_json(state_path,{'checked_at':now(),'managed_dual_hashes':managed,'pending_dual':pending,'status':'syncing'})
+                    elif result=='conflict':conflicts.append(str(rel))
+    atomic_json(state_path,{'checked_at':now(),'copied':copied,'conflicts_preserved':conflicts,'remote_file_count':total,'status':'conflict' if conflicts else 'synced','managed_dual_hashes':managed,'pending_dual':pending})
     print(json.dumps({'copied_count':len(copied),'conflict_count':len(conflicts)}))
 if __name__=='__main__':main()

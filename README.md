@@ -20,6 +20,7 @@ flowchart LR
 - 只有接收器收到、验证并写入磁盘后，手表才把这一段标为“已送达”；这只代表原音保存好了，转写和写笔记是之后的独立步骤。
 - 没说话的片段（静音、环境声）会被识别为“无语音”，不会生成空笔记。
 - 每个有语音的约 60 秒片段生成一篇 Markdown，带日期、来源 ID 和时间戳。
+- 可选的双版本文字层正在接入：把相邻转写整理成每日“口语清稿”和“七删一改整理稿”，正文隐藏机器标识；启用时会向 DeepSeek 官方 API 发送转写文字并产生文字处理费用。配置、原文保留和验收边界见[双版本输出](docs/dual-text-output.md)。
 - iPhone 只用于把 App 装到手表上（手表 App 必须随 iPhone App 一起安装），不负责中转录音。
 
 ## 两种部署方式，选一种
@@ -97,6 +98,7 @@ python3 scripts/pair.py         # 生成手表一次性配对码（10 分钟有�
 - 配对密钥、原音、数据库、转写和日志都在 `data/`（已被 `.gitignore` 忽略）。配对码一次性、10 分钟过期，服务器只存它的哈希。
 - 公网入口只转发加密上传和配对认领两个接口，没有文件下载、目录浏览或管理接口。
 - 转写全程本地离线；模型只在安装时下载一次。
+- 可选文字整理使用云端 DeepSeek；启用后会发送转写文本及有限上下文，音频识别仍在本地。完整链路此时不是完全离线。
 - 请让对话者知情，并遵守当地关于录音的法律。
 
 ## 目录
@@ -112,6 +114,7 @@ docs/                部署、App 编译安装、排障、加密协议
 ## 文档
 
 - [docs/deployment.md](docs/deployment.md)：两种接收端的部署、HTTPS 入口、后台服务、显卡、存储与回滚
+- [docs/dual-text-output.md](docs/dual-text-output.md)：可选口语清稿、七删一改、DeepSeek 费用边界与双版本输出
 - [docs/apple-build.md](docs/apple-build.md)：编译安装手表 App、首次配对
 - [docs/troubleshooting.md](docs/troubleshooting.md)：Xcode 连不上手表、VPN 冲突等真实踩坑
 - [docs/wire-v2.md](docs/wire-v2.md)：加密上传协议 v2

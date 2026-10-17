@@ -95,6 +95,20 @@ class EndToEndWithStubASR(unittest.TestCase):
             'original_name': app['chunk_id'] + '.m4a', 'is_test': True, 'source_url': None, 'app_metadata': app}), encoding='utf-8')
         os.utime(final, (time.time() - 120,) * 2)
         return sha
+    def test_asr_only_preserves_source_without_raw_note_or_cloud(self):
+        w.PUBLISH_OUTPUTS = False
+        segments = [{'start': 0, 'end': 1, 'text': 'policy fixture'}]
+        sha = self.publish(segments)
+        with patch.object(w, 'lark', side_effect=AssertionError('ASR-only must not publish')):
+            jobs = self.run_scan(segments)
+        job = next(x for x in jobs if x.get('source_id') == sha)
+        self.assertEqual(job['status'], 'done')
+        self.assertEqual(job['publication_status'], 'disabled')
+        self.assertFalse(job['lark_verified'])
+        self.assertIsNone(job['note_path'])
+        self.assertTrue((self.root/'asr/outbox'/sha/'receipt.json').is_file())
+        self.assertFalse((self.root/'outbox/录音资料').exists())
+
     def run_scan(self, segments):
         with patch.object(w.asr_worker.Processor, 'transcribe', lambda _self, _src, _work: (60.0, segments)):
             db = w.db_open()
