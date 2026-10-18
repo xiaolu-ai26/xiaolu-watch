@@ -33,7 +33,7 @@ def validate_reading(group, units):
             if not any(i in by_index and repetition_key(by_index[i]['text'])==repetition_key(text) for i in kept):
                 raise ValueError('reading_repetition_without_retained_evidence')
         elif reason=='filler':
-            if not re.fullmatch(r'(?:嗯|呃|啊|哦|诶|那个|就是|然后|um|uh|erm|er)+',norm):
+            if norm != '哎' and not re.fullmatch(r'(?:嗯|呃|啊|哦|诶|那个|就是|然后|um|uh|erm|er)+',norm):
                 raise ValueError('reading_filler_contains_information')
         elif reason=='greeting':
             if not re.fullmatch(r'(?:(?:拜拜|再见|你好|早安|晚安|hello|hi|bye|goodbye|thankyou|thanks)+|thankyouforwatching(?:andseeyouinthenextvideo)?|感谢观看我们下期再见)',norm):
@@ -155,3 +155,18 @@ def retain_literal_repetitions(value, units):
             else:removed.append(item)
         plan['retained_indices']=sorted(kept);plan['excluded']=removed
     return result,actions
+
+
+def normalize_editor_response(value,units):
+    """Lossless conversion of one known terms representation; raw stays untouched."""
+    import copy
+    candidate=copy.deepcopy(value);actions=[]
+    terms=candidate.get('uncertain_terms') if isinstance(candidate,dict) else None
+    if isinstance(terms,list) and 0<len(terms)<=30 and all(isinstance(x,dict) and set(x)=={'term','note'} for x in terms):
+        if all(isinstance(x[k],str) and x[k].strip() and len(x[k])<=80 for x in terms for k in ('term','note')):
+            strings=[x['term']+'（'+x['note']+'）' for x in terms]
+            if all(len(x)<=80 for x in strings):
+                candidate['uncertain_terms']=strings
+                actions=[{'field':'uncertain_terms','index':i,'action':'lossless_term_note_to_string'} for i in range(len(strings))]
+    normalized,repetitions=retain_literal_repetitions(candidate,units)
+    return normalized,actions+repetitions

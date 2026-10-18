@@ -83,7 +83,7 @@ def apply_pending(worker,candidate,verified_provider=None):
         if c.get('daily_overview'):
             kept=[g for g in cards(prospective) if g['reading_role']!='background']
             validate_summary(c['daily_overview'],{g['id'] for g in kept},'\n'.join(g['summary_input'] for g in kept))
-        if not batch.get('output'):
+        if not batch.get('output') and verified_provider is None:
             # Clear only this reviewed batch's budget wait after successful preflight.
             batch.update(retry_after=0,attempts=0);worker.state.put(key,batch)
     provider=verified_provider or ManualProvider(c)
@@ -91,7 +91,7 @@ def apply_pending(worker,candidate,verified_provider=None):
         worker.provider=provider;worker.config['max_batches_per_tick']=1
         if batch.get('output'):
             with retirement.guard(worker.config,c['generation']):worker._publish(batch)
-        else:worker.tick(reviewed_scope={'batch_id':c['batch_id'],'source_ids':c['source_ids'],'expected_generation':c['generation']})
+        else:worker.tick(reviewed_scope={'batch_id':c['batch_id'],'source_ids':c['source_ids'],'expected_generation':c['generation'],'offline_verified_response':verified_provider is not None})
     finally:
         worker.provider=original_provider;worker.config['max_batches_per_tick']=original_limit
     with retirement.guard(worker.config,c['generation']):

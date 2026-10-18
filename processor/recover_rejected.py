@@ -1,7 +1,7 @@
 """Offline replay of a reviewed, fully received provider result; no new API call."""
 import copy
 from text_output.core import digest
-from text_output.editorial import retain_literal_repetitions,READING_POLICY_VERSION
+from text_output.editorial import normalize_editor_response,normalized,READING_POLICY_VERSION
 from text_output.conversation import validate_groups,utterances
 from text_output.store import State
 from context_analysis import retirement
@@ -23,13 +23,20 @@ def replay(worker,admission,binding,rows,previous,context):
     current_context=earlier[-1]['raw_tail'] if earlier else ''
     if digest(current_previous)!=binding['previous_hash'] or digest(current_context)!=binding['context_hash']:raise ValueError('replay_live_context_changed')
 
-    units=utterances(rows);value,actions=retain_literal_repetitions(rejected['model_output'],units)
-    if not actions:raise ValueError('replay_no_proven_conservative_normalization')
+    units=utterances(rows);value,actions=normalize_editor_response(rejected['model_output'],units)
     validate_groups(value,units,previous,context,require_reading=True)
+    if not actions:
+        by_index={unit['i']:unit['text'] for unit in units}
+        actions=[{'unit_index':item['index'],'original_reason':'filler','action':'revalidated_bare_chinese_interjection'}
+            for group in value['groups'] for item in group['reading']['excluded']
+            if item['reason']=='filler' and normalized(by_index[item['index']])=='哎']
+        if rejected.get('reason')!='editor_validation_failed' or not actions:
+            raise ValueError('replay_no_proven_conservative_normalization')
     candidate={'approved_for_apply':True,'provenance':'codex_reviewed_manual','policy':READING_POLICY_VERSION,
         'generation':binding['generation'],'batch_id':binding['batch_id'],'source_ids':[row.source_id for row in rows],
         'units_hash':unit_hash(units),'previous_group_id':previous['id'] if previous else None,'reviewed_at':binding['reviewed_at'],'value':value}
     class VerifiedReplay(ManualProvider):
+        offline_replay=True
         def edit_conversations(self,current_rows,current_units,current_previous,current_context):
             if digest(current_previous)!=binding['previous_hash'] or digest(current_context)!=binding['context_hash']:
                 raise ValueError('replay_context_changed')

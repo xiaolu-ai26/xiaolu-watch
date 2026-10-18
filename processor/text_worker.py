@@ -295,7 +295,10 @@ class Worker:
             if waiting_budget:
                 budget = self.state.budget(dt.datetime.now(dt.timezone.utc).date().isoformat())
                 budget_available = budget['committed_tokens'] < int(self.config.get('provider',{}).get('daily_token_reservation_limit',0))
-            if batch.get('attempts', 0) >= 3 or (batch.get('retry_after', 0) > now and not (waiting_budget and budget_available)):
+            offline_replay = reviewed_scope is not None and reviewed_scope.get('offline_verified_response') is True
+            if offline_replay and getattr(self.provider,'offline_replay',False) is not True:
+                raise ValueError('offline_replay_provider_required')
+            if not offline_replay and (batch.get('attempts', 0) >= 3 or (batch.get('retry_after', 0) > now and not (waiting_budget and budget_available))):
                 continue
             if not any(r.text for r in rows):
                 with retirement.guard(self.config, generation):
@@ -324,9 +327,10 @@ class Worker:
                     conversation_previous = prior['conversation_groups'][-1]
                     context = prior['raw_tail']
             # Persist the attempt before network I/O; crashes count toward the retry ceiling too.
-            with retirement.guard(self.config, generation):
-                batch.update(attempts=batch['attempts'] + 1, retry_after=now + 600)
-                self.state.put(key, batch)
+            if not offline_replay:
+                with retirement.guard(self.config, generation):
+                    batch.update(attempts=batch['attempts'] + 1, retry_after=now + 600)
+                    self.state.put(key, batch)
             try:
                 if self.conversation_mode:
                     grouped, provenance = retirement.request(self.provider, lambda: self.provider.edit_conversations(rows, units, conversation_previous, context), self.config, generation,
