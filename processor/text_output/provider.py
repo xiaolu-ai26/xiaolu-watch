@@ -1,4 +1,7 @@
 """Explicit DeepSeek first-party text-only client. No arbitrary URL or tool calls."""
+import contextlib
+import http.client
+import functools
 import datetime as dt
 import json
 from pathlib import Path
@@ -35,11 +38,53 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
         raise RuntimeError('provider_redirect_denied')
 
 
+class GuardedHTTPSConnection(http.client.HTTPSConnection):
+    """Hold retirement admission only through actual header/body transmission.
+
+    TLS/connect/write has an 8s bound. getresponse/read runs after the lock is
+    released, with the original response timeout. A deletion can commit while
+    inference runs; its response is subsequently discarded by the caller guard.
+    """
+    def __init__(self, *args, guard_factory=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.guard_factory = guard_factory or contextlib.nullcontext
+
+    def request(self, *args, **kwargs):
+        response_timeout = self.timeout
+        self.timeout = 8
+        try:
+            with self.guard_factory():
+                return super().request(*args, **kwargs)
+        finally:
+            self.timeout = response_timeout
+            if self.sock is not None:
+                self.sock.settimeout(response_timeout)
+
+
+class GuardedHTTPSHandler(urllib.request.HTTPSHandler):
+    def __init__(self, guard_factory):
+        super().__init__()
+        self.guard_factory = guard_factory
+
+    def https_open(self, request):
+        connection = functools.partial(GuardedHTTPSConnection, guard_factory=self.guard_factory)
+        return self.do_open(connection, request, context=self._context)
+
+
 class DeepSeek:
     def __init__(self, config, state):
         if config.get('provider') != 'deepseek' or config.get('model') != 'deepseek-flash':
             raise ValueError('Only explicit first-party DeepSeek Flash is supported')
-        self.config = config; self.state = state
+        self.config = config; self.state = state; self._egress_guard = contextlib.nullcontext
+
+    @contextlib.contextmanager
+    def with_egress_guard(self, factory):
+        previous = self._egress_guard
+        self._egress_guard = factory
+        try:
+            yield
+        finally:
+            self._egress_guard = previous
 
     def edit(self, rows, context=''):
         user = request_data(rows, context)
@@ -85,7 +130,7 @@ class DeepSeek:
             payload.pop('temperature')
         request = urllib.request.Request(ENDPOINT, data=json.dumps(payload, ensure_ascii=False).encode(),
                                          headers={'Authorization': 'Bearer ' + key, 'Content-Type': 'application/json'})
-        opener = urllib.request.build_opener(NoRedirect())
+        opener = urllib.request.build_opener(NoRedirect(), GuardedHTTPSHandler(self._egress_guard))
         try:
             with opener.open(request, timeout=180 if effort in ('high', 'max') else 90) as response:
                 raw = response.read(512 * 1024 + 1)
@@ -112,7 +157,8 @@ class DeepSeek:
         try:
             parsed = json.loads(message['content'])
         except (KeyError, TypeError, json.JSONDecodeError):
-            self.state.put('rejected:' + str(admission), {'reason': 'editor_invalid_json', 'sources': [r.identity() for r in rows]})
+            with self._egress_guard():
+                self.state.put('rejected:' + str(admission), {'reason': 'editor_invalid_json', 'sources': [r.identity() for r in rows]})
             raise CompletionRejected('editor_invalid_json') from None
         try:
             output = validator(parsed)
@@ -120,7 +166,8 @@ class DeepSeek:
             code = EDITOR_CODES.get(str(e), 'editor_validation_failed')
             # Private SQLite only. Never emit model content/reasoning in status, logs or notes.
             private_value = parsed if len(json.dumps(parsed, ensure_ascii=False).encode()) <= 128 * 1024 else None
-            self.state.put('rejected:' + str(admission), {'reason': code, 'model_output': private_value, 'sources': [r.identity() for r in rows]})
+            with self._egress_guard():
+                self.state.put('rejected:' + str(admission), {'reason': code, 'model_output': private_value, 'sources': [r.identity() for r in rows]})
             raise CompletionRejected(code) from None
         return output, {'model': result['model'], 'provider': 'api.deepseek.com', 'usage': result.get('usage', {}),
                         'admission_id': admission, 'requested_effort': requested_effort, 'effective_effort': effort}

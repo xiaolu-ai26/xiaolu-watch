@@ -298,6 +298,13 @@ final class PhoneCoordinator: NSObject, ObservableObject, WCSessionDelegate, URL
                 guard attempt.systemTaskID == task.taskIdentifier, error == nil,
                       let response = task.response as? HTTPURLResponse,
                       let config = try KeychainConfiguration.read() else { throw TransportError.incompleteAttempt }
+                if response.statusCode == 410 {
+                    let mac = response.value(forHTTPHeaderField: "X-Watch-Retirement-MAC")
+                    let retired = try SealedTransport.verifyRetirement(data, macBase64: mac, statusCode: response.statusCode, attempt: attempt, configuration: config)
+                    try store.retireOwnerDeleted(eventID, receipt: retired, signedBody: data, mac: mac!)
+                    try? attempts.finish(id, succeeded: true)
+                    self.refresh(); return
+                }
                 let receipt = try SealedTransport.verifyReceipt(data,
                     macBase64: response.value(forHTTPHeaderField: "X-Watch-Receipt-MAC"),
                     statusCode: response.statusCode, attempt: attempt, configuration: config)

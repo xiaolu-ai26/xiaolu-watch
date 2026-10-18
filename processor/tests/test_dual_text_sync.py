@@ -60,3 +60,45 @@ class DualSyncTests(unittest.TestCase):
 
 
 if __name__=='__main__':unittest.main()
+
+class DeletionAckTests(unittest.TestCase):
+    def test_offline_older_managed_note_deleted_b_preserved_and_acknowledged(self):
+        with tempfile.TemporaryDirectory() as td:
+            root=Path(td).resolve();home=root/'home';home.mkdir();vault=root/'vault';vault.mkdir();directory=vault/'口语清稿';directory.mkdir()
+            rel='口语清稿/2026-10-18_口语清稿.md';target=vault/rel;target.write_bytes(b'older-owned')
+            other=directory/'2026-10-19_口语清稿.md';other.write_text('B preserved')
+            old=hashlib.sha256(target.read_bytes()).hexdigest();remote_new=hashlib.sha256(b'newer-not-yet-pulled').hexdigest()
+            state=home/'state/mac-sync.json';state.parent.mkdir();state.write_text(json.dumps({'managed_dual_hashes':{rel:old}}))
+            (home/'settings.json').write_text(json.dumps({'mac_sync':{'enabled':True,'destination':str(vault),'ssh_host':'fixture','remote_notes_dir':'old','remote_dual_text_dir':'dual'}}))
+            acknowledgments=[]
+            def run(argv,timeout):
+                if str(argv[-1]).endswith('consumer-ack.json') and str(argv[-1]).startswith('fixture:'):
+                    acknowledgments.append(json.loads(Path(argv[-2]).read_text()));return ''
+                data={'version':1,'files':[]}
+                if ':dual/' in argv[-2]:data.update(kind='dual-text',generation=1,manifest_revision='fixture-revision',deleted=[{'relative_path':rel,'sha256':remote_new}])
+                Path(argv[-1]).write_text(json.dumps(data));return ''
+            with patch.object(sync,'run',side_effect=run),patch.object(sys,'argv',['sync','--home',str(home)]):sync.main()
+            self.assertFalse(target.exists());self.assertEqual(other.read_text(),'B preserved')
+            self.assertEqual(acknowledgments[0]['manifest_revision'],'fixture-revision');self.assertEqual(acknowledgments[0]['conflicts'],[])
+            self.assertEqual(len(list((vault/'.watch-memory-trash').iterdir())),1)
+
+class DeletedRenameRecoveryTests(unittest.TestCase):
+    def test_renamed_b_with_managed_a_and_only_deleted_manifest(self):
+        with tempfile.TemporaryDirectory() as td:
+            root=Path(td).resolve();home=root/'home';home.mkdir();vault=root/'vault';vault.mkdir();(vault/'口语清稿').mkdir()
+            rel='口语清稿/2026-10-18_口语清稿.md';target=vault/rel;target.write_bytes(b'B-after-rename')
+            a=hashlib.sha256(b'A-before-update').hexdigest();b=hashlib.sha256(target.read_bytes()).hexdigest()
+            state=home/'state/mac-sync.json';state.parent.mkdir();state.write_text(json.dumps({'managed_dual_hashes':{rel:a},'pending_dual':{rel:{'old':a,'new':b}}}))
+            (home/'settings.json').write_text(json.dumps({'mac_sync':{'enabled':True,'destination':str(vault),'ssh_host':'fixture','remote_notes_dir':'old','remote_dual_text_dir':'dual'}}))
+            acknowledgments=[]
+            def run(argv,timeout):
+                if str(argv[-1]).startswith('fixture:'):
+                    acknowledgments.append(json.loads(Path(argv[-2]).read_text()));return ''
+                data={'version':1,'files':[]}
+                if ':dual/' in argv[-2]:data.update(kind='dual-text',generation=2,manifest_revision='delete-only',deleted=[{'relative_path':rel,'sha256':b}])
+                Path(argv[-1]).write_text(json.dumps(data));return ''
+            with patch.object(sync,'run',side_effect=run),patch.object(sys,'argv',['sync','--home',str(home)]):
+                sync.main();sync.main()  # Cold/repeated run cannot get stuck after ownership recovery.
+            self.assertFalse(target.exists());self.assertEqual(len(list((vault/'.watch-memory-trash').iterdir())),1)
+            self.assertEqual(acknowledgments[-1]['conflicts'],[])
+            saved=json.loads(state.read_text());self.assertEqual(saved['pending_dual'],{});self.assertEqual(saved['managed_dual_hashes'],{})

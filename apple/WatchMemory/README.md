@@ -1,11 +1,11 @@
 # 手表 App 设计说明
 
-原生 watchOS 录音 App + iPhone 伴侣 App。手表拥有录音文件和上传队列，自己直接上传到你配置的 HTTPS 接收端；iPhone 只负责安装和可选的配置/备用中转（默认关闭）。编译安装见 [docs/apple-build.md](../../docs/apple-build.md)。
+原生 watchOS 录音 App + iPhone 伴侣 App。手表拥有录音文件和上传队列，自己直接上传到你配置的 HTTPS 接收端；iPhone 负责安装、可选连接/备用中转（默认关闭），以及 [今日阅读与背景采集](../../docs/phone-today.md)。手表直传不依赖手机持续运行。编译安装见 [docs/apple-build.md](../../docs/apple-build.md)。
 
 ## 结构
 
 - `WatchApp/`：SwiftUI 界面、`WatchRecorder`（AVAudioEngine 采集、分段、编码、中断恢复）、`WatchDirectUploader`（手表直传、后台任务、回执校验）、`WatchPairingSetup`（一次性码认领配置）。
-- `PhoneApp/`：伴侣 App，扫码/粘贴配置、可选的手机备用中转（默认关闭）。`BackgroundUploadScheduling.swift` 与 `KeychainConfiguration.swift` 也编译进手表 App。
+- `PhoneApp/`：今日页、自然对话详情、双稿阅读、回收预览、独立 Phone v3 连接与背景队列、只读 HealthKit 和大致地点；另保留扫码/粘贴手表配置、可选手机备用中转（默认关闭）。`BackgroundUploadScheduling.swift` 与 `KeychainConfiguration.swift` 也编译进手表 App。
 - `Sources/WatchMemoryCore/`：无录音/网络副作用的共享核心：原子 manifest 与状态机、v2 密封与回执校验、上传尝试日志、配对策略、诊断。
 - `Tests/`：`CoreChecks`、`WireV2Checks`、`SchedulingChecks` 可在 macOS 上直接 `swift run`；`WatchMemoryCoreTests` 为 XCTest 版本；`Fixtures/` 是明确标注的公开确定性测试夹具（含公开测试密钥，绝不能用于真实配对）。
 - `project.yml`：XcodeGen 工程定义；签名信息来自 `Config/Local.xcconfig`（不进 git）。
@@ -40,3 +40,7 @@
 - 获取方式：接收端生成 80 bit 一次性码（10 分钟）；手表用 `POST /v2/pair/claim` 认领。码可以由 Mac 上的 Xcode 工具以 `onboarding.json` 投递进 App 数据目录（零输入），也可以在手表上输入。App 先把码和随机 attempt ID 存进钥匙串再发请求，响应丢失可用同一 ID 重取；长期配置保存成功后才删掉短期码。
 - 认领请求：禁止重定向、缓存、cookie；响应上限 8 KiB；返回的 endpoint 必须与请求的主机和端口一致。
 - 第一个 MAC 正确的录音回执才证明接收端真的持有密钥。
+
+## Phone v3 与确认删除
+
+Phone 背景与阅读使用独立 Keychain principal 和 HTTPS，同源、有限响应、禁止重定向，不复用音频密钥。HealthKit增量 checkpoint 只在相应持久 ACK 后推进；地点 epoch/floor 阻止关闭区间的缓存与旧回调重新入队。用户选择的对话先取得回收范围预览，传播未完成或共享原音保留必须明确显示。专用 owner-deletion 退休回执与 stored ACK 分离，裸 HTTP 410 不授权清理。完整合同见 [phone-v3-api](../../docs/phone-v3-api.md)。

@@ -10,8 +10,9 @@ import wire_v2
 class Server(ThreadingHTTPServer):
     daemon_threads=True
     request_deadline_seconds=90
-    def __init__(self,address,upstream_port,bootstrap=None):
+    def __init__(self,address,upstream_port,bootstrap=None,phone_port=None):
         if address[0]!='127.0.0.1':raise ValueError('Ingress must remain loopback-only')
+        self.phone_port=phone_port
         self.bootstrap=bootstrap
         self.upstream_port=upstream_port;self.slots=threading.BoundedSemaphore(2);self.rate_lock=threading.Lock();self.tokens=120.;self.last=time.monotonic()
         super().__init__(address,Handler)
@@ -52,15 +53,70 @@ class Handler(BaseHTTPRequestHandler):
             if upstream:upstream.close()
         with contextlib.suppress(OSError):self.connection.shutdown(socket.SHUT_RDWR)
     def finish(self):self.deadline.cancel();super().finish()
-    def reply(self,status,body=b'{}',mac=None,no_store=False):
+    def reply(self,status,body=b'{}',mac=None,no_store=False,retirement_mac=None):
         self.close_connection=True
         with contextlib.suppress(OSError):
             self.send_response_only(status);self.send_header('Content-Type','application/json');self.send_header('Content-Length',str(len(body)));self.send_header('Connection','close')
             if mac:self.send_header('X-Watch-Receipt-MAC',mac)
+            if retirement_mac:self.send_header('X-Watch-Retirement-MAC',retirement_mac)
             if no_store:self.send_header('Cache-Control','no-store');self.send_header('Pragma','no-cache')
             self.end_headers();self.wfile.write(body)
-    def do_GET(self):self.reply(200,b'{"ok":true}') if self.path=='/health' else self.reply(404)
+    def do_GET(self):
+        if self.path.startswith('/v3/phone/'):
+            if re.fullmatch(r'/v3/phone/today\?date=\d{4}-\d{2}-\d{2}',self.path) or re.fullmatch(r'/v3/phone/deletions/[0-9a-f-]{36}',self.path):self.phone_proxy('GET',0)
+            else:self.reply(404,no_store=True)
+            return
+        self.reply(200,b'{"ok":true}') if self.path=='/health' else self.reply(404)
+    def phone_proxy(self,method,limit):
+        if self.server.phone_port is None:self.reply(404,no_store=True);return
+        if not self.server.rate_allow():self.reply(429,no_store=True);return
+        claim=self.path=='/v3/phone/pair/claim'
+        auth=self.headers.get_all('Authorization',[])
+        if not claim and (len(auth)!=1 or not re.fullmatch(r'Bearer [A-Za-z0-9_-]{43}',auth[0])):self.reply(401,no_store=True);return
+        lengths=self.headers.get_all('Content-Length',[])
+        if self.headers.get('Transfer-Encoding'):self.reply(411,no_store=True);return
+        size=0
+        if method=='POST':
+            if len(lengths)!=1 or not lengths[0].isdigit():self.reply(411,no_store=True);return
+            size=int(lengths[0])
+            if not 1<=size<=limit:self.reply(413,no_store=True);return
+            if self.headers.get('Content-Type','').split(';')[0].strip().lower()!='application/json':self.reply(415,no_store=True);return
+        elif lengths and (len(lengths)!=1 or lengths[0]!='0'):self.reply(400,no_store=True);return
+        upstream=None
+        try:
+            self.connection.settimeout(min(15,self.remaining()));body=self.rfile.read(size) if size else None
+            if size and len(body)!=size:self.reply(400,no_store=True);return
+            upstream=http.client.HTTPConnection('127.0.0.1',self.server.phone_port,timeout=min(30,self.remaining()))
+            with self.upstream_lock:
+                if self.expired:raise TimeoutError('request deadline')
+                self.upstream=upstream
+            upstream.connect()
+            with self.upstream_lock:
+                self.upstream_socket=upstream.sock
+                if self.expired:
+                    if self.upstream_socket:self.upstream_socket.shutdown(socket.SHUT_RDWR)
+                    raise TimeoutError('request deadline')
+            headers={'Content-Length':str(size)}
+            if method=='POST':headers['Content-Type']='application/json'
+            if not claim:headers['Authorization']=auth[0]
+            if upstream.sock:upstream.sock.settimeout(self.remaining())
+            upstream.request(method,self.path,body=body,headers=headers)
+            if self.upstream_socket:self.upstream_socket.settimeout(self.remaining())
+            response=upstream.getresponse()
+            if self.upstream_socket:self.upstream_socket.settimeout(self.remaining())
+            raw=response.read(2*1024*1024+1)
+            if len(raw)>2*1024*1024:self.reply(502,no_store=True);return
+            self.reply(response.status,raw,no_store=True)
+        except (OSError,http.client.HTTPException):self.reply(502,no_store=True)
+        finally:
+            if upstream:upstream.close()
+            with self.upstream_lock:self.upstream=None;self.upstream_socket=None
     def do_POST(self):
+        if self.path.startswith('/v3/phone/'):
+            limit=1024 if self.path=='/v3/phone/pair/claim' else 256*1024 if self.path=='/v3/phone/context' else 2048 if re.fullmatch(r'/v3/phone/cards/[A-Za-z0-9_-]{1,128}/deletion-plan',self.path) or re.fullmatch(r'/v3/phone/deletions/[0-9a-f-]{36}/commit',self.path) else None
+            if limit:self.phone_proxy('POST',limit)
+            else:self.reply(404,no_store=True)
+            return
         if self.path!='/v2/pair/claim' or self.server.bootstrap is None:self.reply(404);return
         if not self.server.rate_allow():self.reply(429);return
         lengths=self.headers.get_all('Content-Length',[])
@@ -119,7 +175,7 @@ class Handler(BaseHTTPRequestHandler):
             if upstream.sock:upstream.sock.settimeout(self.remaining())
             reply=r.read(65537)
             if len(reply)>65536:self.reply(502);return
-            self.reply(r.status,reply,r.getheader('X-Watch-Receipt-MAC'))
+            self.reply(r.status,reply,r.getheader('X-Watch-Receipt-MAC'),retirement_mac=r.getheader('X-Watch-Retirement-MAC'))
         except (OSError,http.client.HTTPException):self.reply(502)
         finally:
             if upstream:upstream.close()
@@ -127,10 +183,10 @@ class Handler(BaseHTTPRequestHandler):
 
 def main():
     import argparse
-    p=argparse.ArgumentParser();p.add_argument('--port',type=int,default=18438);p.add_argument('--upstream-port',type=int,default=18437);p.add_argument('--bootstrap-root');a=p.parse_args()
+    p=argparse.ArgumentParser();p.add_argument('--port',type=int,default=18438);p.add_argument('--upstream-port',type=int,default=18437);p.add_argument('--bootstrap-root');p.add_argument('--phone-port',type=int);a=p.parse_args()
     bootstrap=None
     if a.bootstrap_root:
         from bootstrap_pairing import Bootstrap
         bootstrap=Bootstrap(a.bootstrap_root)
-    Server(('127.0.0.1',a.port),a.upstream_port,bootstrap).serve_forever()
+    Server(('127.0.0.1',a.port),a.upstream_port,bootstrap,a.phone_port).serve_forever()
 if __name__=='__main__':main()

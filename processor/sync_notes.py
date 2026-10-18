@@ -133,6 +133,33 @@ def main():
                 run(scp+[remote(source,'manifest.json'),str(listing)],timeout=30)
                 manifest=json.loads(listing.read_text(encoding='utf-8'))
             if manifest.get('version')!=1 or not isinstance(manifest.get('files'),list) or (scopes==DUAL_SCOPES and manifest.get('kind')!='dual-text'):raise ValueError('unsupported outbox manifest')
+            if scopes==DUAL_SCOPES:
+                for item in manifest.get('deleted', []):
+                    rel=safe_relative(item['relative_path'],scopes)
+                    expected=item.get('sha256')
+                    fd=anchor.child(rel.parts[0]);old=existing_hash(fd,rel.name)
+                    # Recover the durable rename journal BEFORE processing a deletion-only
+                    # manifest: there may be no active file row to restore ownership later.
+                    if str(rel) in pending and old is not None:
+                        intent=pending[str(rel)]
+                        if old==intent['new']:
+                            managed[str(rel)]=intent['new'];pending.pop(str(rel))
+                        elif old==intent['old']:
+                            pending.pop(str(rel))
+                        else:
+                            conflicts.append(str(rel));continue
+                    if old is None:
+                        managed.pop(str(rel),None);pending.pop(str(rel),None);continue
+                    if not expected or managed.get(str(rel))!=old:
+                        conflicts.append(str(rel));continue
+                    # Scoped recoverable trash; never remove a file the user edited.
+                    trash=anchor.child('.watch-memory-trash')
+                    anchor.validate()
+                    if existing_hash(fd,rel.name)!=old:
+                        conflicts.append(str(rel));continue
+                    os.rename(rel.name,rel.parts[0]+'-'+uuid.uuid4().hex+'-'+rel.name,src_dir_fd=fd,dst_dir_fd=trash)
+                    os.fsync(fd);os.fsync(trash)
+                    managed.pop(str(rel),None);pending.pop(str(rel),None)
             total+=len(manifest['files'])
             for item in manifest['files']:
                 rel=safe_relative(item['relative_path'],scopes);expected=item['sha256'];size=item['bytes']
@@ -166,6 +193,11 @@ def main():
                             managed[str(rel)]=expected;pending.pop(str(rel),None)
                             atomic_json(state_path,{'checked_at':now(),'managed_dual_hashes':managed,'pending_dual':pending,'status':'syncing'})
                     elif result=='conflict':conflicts.append(str(rel))
+            if scopes==DUAL_SCOPES and 'generation' in manifest:
+                acknowledgment={'generation':manifest['generation'],'manifest_revision':manifest.get('manifest_revision'),'files':manifest['files'],'deleted':manifest.get('deleted',[]),'conflicts':conflicts,'checked_at':now()}
+                with tempfile.TemporaryDirectory(prefix='xiaolu-watch-ack-') as td:
+                    ackfile=Path(td)/'consumer-ack.json';ackfile.write_text(json.dumps(acknowledgment),encoding='utf-8')
+                    run(scp+[str(ackfile),remote(source,'consumer-ack.json')],timeout=30)
     atomic_json(state_path,{'checked_at':now(),'copied':copied,'conflicts_preserved':conflicts,'remote_file_count':total,'status':'conflict' if conflicts else 'synced','managed_dual_hashes':managed,'pending_dual':pending})
     print(json.dumps({'copied_count':len(copied),'conflict_count':len(conflicts)}))
 if __name__=='__main__':main()

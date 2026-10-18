@@ -70,3 +70,15 @@ def verify_receipt(secret,challenge,cipher_sha,status,raw_json,received_mac):
         expected=receipt_mac(secret,challenge,cipher_sha,status,raw_json)
         return hmac.compare_digest(expected.encode('ascii'),received_mac.encode('ascii'))
     except (ValueError,UnicodeError,AttributeError):return False
+
+def retirement_mac(secret,challenge,cipher_sha,raw_json):
+    """Owner deletion retirement, intentionally incompatible with a stored ACK."""
+    derive(secret)  # Same canonical secret validation, distinct HKDF purpose.
+    if not canonical_uuid(challenge) or not re.fullmatch('[0-9a-f]{64}',cipher_sha):raise WireError('invalid_retirement_context')
+    key=HKDF(algorithm=hashes.SHA256(),length=32,salt=b'watch-memory-v2',info=b'retirement-authentication').derive(secret.encode('utf-8'))
+    prefix=f'watch-memory-retired-v2\n{challenge}\n{cipher_sha}\n410\n'.encode('utf-8')
+    return base64.b64encode(hmac.new(key,prefix+raw_json,hashlib.sha256).digest()).decode('ascii')
+
+def verify_retirement(secret,challenge,cipher_sha,raw_json,received_mac):
+    try:return hmac.compare_digest(retirement_mac(secret,challenge,cipher_sha,raw_json).encode('ascii'),received_mac.encode('ascii'))
+    except (ValueError,UnicodeError,AttributeError,TypeError):return False

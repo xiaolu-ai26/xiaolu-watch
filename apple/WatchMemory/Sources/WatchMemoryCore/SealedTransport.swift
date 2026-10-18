@@ -92,3 +92,42 @@ public enum SealedTransport {
         return Data(HMAC<SHA256>.authenticationCode(for: input, using: key(secret, info: "receipt-authentication"))).base64EncodedString()
     }
 }
+
+/// Distinct owner-deletion evidence. A 410 or stored receipt alone can never authorize local retirement.
+public struct OwnerRetirementReceipt: Codable, Sendable {
+    public let schema_version: Int
+    public let `protocol`: String
+    public let purpose: String
+    public let retired: Bool
+    public let source_id: String
+    public let sha256: String
+    public let chunk_id: String
+    public let session_id: String
+    public let sequence: Int
+    public let deletion_id: String
+    public func validates(_ chunk: Chunk) -> Bool {
+        schema_version == 2 && self.protocol == SealedTransport.protocolName && purpose == "owner_deletion" && retired &&
+        source_id == chunk.sha256 && sha256 == chunk.sha256 && chunk_id == chunk.id.uuidString.lowercased() &&
+        session_id == chunk.sessionID.uuidString.lowercased() && sequence == chunk.sequence && PhoneV3Policy.uuid(deletion_id)
+    }
+}
+extension SealedTransport {
+    public static func verifyRetirement(_ body: Data, macBase64: String?, statusCode: Int,
+                                        attempt: UploadAttempt, configuration: PairingConfiguration) throws -> OwnerRetirementReceipt {
+        _ = try configuration.validatedURL()
+        guard statusCode == 410, body.count <= maxResponseBytes, pairingKeyID(configuration.pairing_secret) == attempt.pairingKeyID,
+              attempt.challenge == attempt.id.uuidString.lowercased(),
+              attempt.path == "/v2/chunks/" + attempt.expectedMetadata.chunk_id else { throw TransportError.invalidEvent }
+        guard let macBase64, macBase64.utf8.count <= 64, let mac = Data(base64Encoded: macBase64), mac.count == 32 else { throw TransportError.missingMAC }
+        var input = Data("watch-memory-retired-v2\n\(attempt.challenge)\n\(attempt.cipherSHA256)\n410\n".utf8); input.append(body)
+        guard HMAC<SHA256>.isValidAuthenticationCode(mac, authenticating: input,
+            using: key(configuration.pairing_secret, info: "retirement-authentication")) else { throw TransportError.authenticationFailed }
+        let receipt = try JSONDecoder().decode(OwnerRetirementReceipt.self, from: body)
+        guard receipt.validates(try attempt.expectedMetadata.makeChunk()) else { throw StoreError.receiptMismatch }
+        return receipt
+    }
+    public static func fixtureRetirementMAC(body: Data, attempt: UploadAttempt, secret: String) -> String {
+        var input = Data("watch-memory-retired-v2\n\(attempt.challenge)\n\(attempt.cipherSHA256)\n410\n".utf8); input.append(body)
+        return Data(HMAC<SHA256>.authenticationCode(for: input, using: key(secret, info: "retirement-authentication"))).base64EncodedString()
+    }
+}

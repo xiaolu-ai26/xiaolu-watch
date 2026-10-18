@@ -164,3 +164,8 @@ provider字段 `thinking_effort` 支持 `disabled`、`low`、`high`、`max`，�
 ### 双稿作为唯一发布输出
 
 公开接收端若不再需要逐分钟原始稿发往笔记或飞书，在 `data/settings.json` 的 `notes` 对象设置 `publish_outputs: false`。这只关闭旧流水线的原始稿发布，ASR原文和durable receipt仍保留，不会关闭录音或识别，也不会代替独立text_worker的启动。旧用户默认保持true以兼容现有行为。需要清理已有笔记时另按明确授权执行，不能通过删状态数据库来伪造“已处理”或重置费用。
+
+
+## 今日阅读与身体背景
+
+今日页和健康／位置背景是新增阅读层，不替代两份全文。部署、同一预算账本、删除同步和数据限制见 [今日页说明](health-today.md)。

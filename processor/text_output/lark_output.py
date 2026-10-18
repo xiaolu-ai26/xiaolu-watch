@@ -64,6 +64,20 @@ def expected(items):
     return [[tag, re.sub(r'\s+', '', plain(text))] for tag, text in items]
 
 
+def identities(items):
+    return [[x.get('id'), x['tag'], x['text']] for x in items]
+
+
+def preserves_owned(previous, current):
+    previous = [x for x in previous if x['tag'] != 'title']
+    expected_ids = [x.get('id') for x in previous]
+    actual_ids = [x.get('id') for x in current if x['tag'] != 'title']
+    if not all(expected_ids) or len(actual_ids) != len(set(actual_ids)):
+        return False
+    old_set = set(expected_ids)
+    return identities([x for x in current if x.get('id') in old_set]) == identities(previous)
+
+
 class Lark:
     def __init__(self, state, home, command=None):
         self.state = state; self.home = Path(home); self.command = command or self._command
@@ -122,7 +136,7 @@ class Lark:
             checked = self.command(['+script', '--command', 'parse', '--content', relative, '--format', 'json'])
             if checked.get('data', {}).get('assessment', {}).get('status') not in ('pass', 'passed'):
                 raise RuntimeError('lark_draft_failed')
-            day = {'create_pending': True, 'expected': expected(items), 'batch_ids': [first['id']], 'initial_batch': first['id']}
+            day = {'create_pending': True, 'expected': expected(items), 'batch_ids': [first['id']], 'initial_batch': first['id'], 'initial_groups': first.get('_groups', [])}
             self.state.put(key, day)
             response = self.command(['+create', '--doc-format', 'xml', '--content', relative])
             self._save_response(date, 'create', response)
@@ -159,18 +173,56 @@ class Lark:
             return self.reconcile(date)
         if not retry_unapplied or shape(current) != pending['base']:
             raise RuntimeError('partial_or_human_edit_requires_review')
+        if day.get('snapshot') and not preserves_owned(day['snapshot'], current):
+            raise RuntimeError('lark_owned_block_identity_changed')
         day.update(expected=pending['base'], snapshot=current, pending=None)
         self.state.put(key, day)
         return day
+
+    def _bind_groups(self, day, groups, kind, current):
+        if not groups:
+            return
+        rendered = []
+        for group in groups:
+            content = group.get(kind + '_rendered')
+            if content is None:
+                raise RuntimeError('group_block_ownership_requires_rendered_metadata')
+            rendered.extend(blocks(content))
+        if shape(current) != expected(rendered):
+            raise RuntimeError('group_block_ownership_shape_mismatch')
+        mapping = day.setdefault('group_blocks', {})
+        offset = 0
+        for group in groups:
+            count = len(blocks(group[kind + '_rendered']))
+            owned = current[offset:offset+count]
+            if any(not x.get('id') for x in owned):
+                raise RuntimeError('group_block_ownership_missing_ids')
+            entry = mapping.setdefault(group['id'], {}).setdefault(kind, [])
+            for block in owned:
+                if block not in entry:
+                    entry.append(block)
+            offset += count
 
     def reconcile(self, date):
         key = 'doc:' + date; day = self.state.get(key)
         current = self.fetch(day['id'])
         if shape(current) != day['expected']:
             raise RuntimeError('lark_human_edit_or_pending_outcome_preserved')
+        if day.get('snapshot') and not preserves_owned(day['snapshot'], current):
+            raise RuntimeError('lark_owned_block_identity_changed')
         if any(not x.get('id') for x in current if x['tag'] != 'title'):
             raise ValueError('document block ids missing')
-        if (day.get('pending') or {}).get('done_key'):
+        pending = day.get('pending') or {}
+        if pending.get('group_bindings'):
+            begin = pending['insert_at']; end = begin + pending['insert_count']
+            self._bind_groups(day, pending['group_bindings'], pending['kind'], current[begin:end])
+        if day.get('initial_groups') and not day.get('initial_groups_bound'):
+            for kind, label in [('clean', '口语清稿'), ('distilled', '七删一改整理稿')]:
+                begin = next(i for i,x in enumerate(current) if x['tag']=='h1' and x['text']==label) + 1
+                end = next((i for i in range(begin,len(current)) if current[i]['tag']=='h1'), len(current))
+                self._bind_groups(day, day['initial_groups'], kind, current[begin:end])
+            day['initial_groups_bound'] = True
+        if pending.get('done_key'):
             self.state.put(day['pending']['done_key'], True)
         day.update(create_pending=False, snapshot=current, pending=None)
         self.state.put(key, day)
@@ -188,14 +240,14 @@ class Lark:
             if self.state.get(done_key):
                 continue
             current = self.fetch(day['id'])
-            if shape(current) != shape(day['snapshot']):
+            if identities(current) != identities(day['snapshot']):
                 raise RuntimeError('lark_human_edit_preserved')
             section = next(i for i, x in enumerate(current) if x['tag'] == 'h1' and x['text'] == label)
             end = next((i for i in range(section + 1, len(current)) if current[i]['tag'] == 'h1'), len(current))
             anchor = current[end - 1]['id']
             insertion = blocks(batch[kind])
             target = shape(current[:end]) + expected(insertion) + shape(current[end:])
-            day.update(expected=target, pending={'batch': batch['id'], 'kind': kind, 'done_key': done_key, 'base': shape(current)})
+            day.update(expected=target, pending={'batch': batch['id'], 'kind': kind, 'done_key': done_key, 'base': shape(current), 'group_bindings': batch.get('_groups', []), 'insert_at': end, 'insert_count': len(insertion)})
             self.state.put(key, day)
             path = self.home / 'fragments' / (batch['id'] + '-' + kind + '.xml')
             atomic(path, fragment(insertion))
@@ -209,3 +261,63 @@ class Lark:
         day['batch_ids'].append(batch['id'])
         self.state.put(key, day)
         return day
+
+    def remove_retired_blocks(self, date, outputs, deleted_group_ids=()):
+        """Retire exact persisted group-owned IDs, never match repeated prose by shape."""
+        key = 'doc:' + date; day = self.state.get(key, {})
+        if not day.get('id'):
+            if day.get('create_pending'):
+                raise RuntimeError('deletion_ambiguous_document_create')
+            return
+        if day.get('pending'):
+            day = self.reconcile(date)
+        current = self.fetch(day['id'])
+        pending = day.get('delete_pending')
+        if pending:
+            if identities(current) == pending.get('after_identity'):
+                day.update(snapshot=current, expected=shape(current), delete_pending=None)
+                self.state.put(key, day)
+            elif identities(current) != pending.get('before_identity'):
+                raise RuntimeError('deletion_human_edit_preserved')
+        if identities(current) != identities(day.get('snapshot', [])):
+            raise RuntimeError('deletion_owned_block_identity_changed')
+        desired = [('title', date + ' 录音清稿与整理稿'), ('h1', '口语清稿')]
+        for output in outputs:
+            desired += blocks(output['clean'])
+        desired += [('h1', '七删一改整理稿')]
+        for output in outputs:
+            desired += blocks(output['distilled'])
+        target = expected(desired)
+        mapping = day.get('group_blocks', {})
+        owned = [block for group in deleted_group_ids for group_kind in mapping.get(group, {}).values() for block in group_kind]
+        owned_by_id = {block['id']: block for block in owned}
+        if len(owned_by_id) != len(owned):
+            raise RuntimeError('deletion_ambiguous_owned_block')
+        actual_by_id = {block.get('id'): block for block in current}
+        for identity, original in owned_by_id.items():
+            if identity in actual_by_id and actual_by_id[identity] != original:
+                raise RuntimeError('deletion_owned_block_content_changed')
+        remaining = [block for block in current if block.get('id') not in owned_by_id]
+        if shape(remaining) != target:
+            raise RuntimeError('deletion_group_ownership_unavailable_or_changed')
+        for index in reversed(range(len(current))):
+            block = current[index]
+            if block.get('id') not in owned_by_id:
+                continue
+            if block['tag'] in ('title','h1'):
+                raise RuntimeError('deletion_protected_heading')
+            before = current; after = current[:index]+current[index+1:]
+            day['delete_pending'] = {'before_identity': identities(before), 'after_identity': identities(after)}
+            self.state.put(key, day)
+            response = self.command(['+update','--doc',day['id'],'--command','block_delete','--block-id',block['id']])
+            if response.get('data',{}).get('warnings'):
+                raise RuntimeError('deletion_warnings_requires_reconcile')
+            verified = self.fetch(day['id'])
+            if identities(verified) != identities(after):
+                raise RuntimeError('deletion_outcome_requires_reconcile')
+            current=verified
+            day.update(snapshot=current, expected=shape(current), delete_pending=None)
+            self.state.put(key, day)
+        for group in deleted_group_ids:
+            day.get('group_blocks', {}).pop(group, None)
+        self.state.put(key,day)

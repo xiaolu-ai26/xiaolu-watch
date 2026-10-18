@@ -139,6 +139,28 @@ public final class ChunkStore: @unchecked Sendable {
             chunk.state = .uploaded; chunk.lastError = nil
         }
     }
+    /// Owner deletion is not a stored ACK. Retain local bytes in a recoverable namespace and stop retries.
+    public func retireOwnerDeleted(_ id: UUID, receipt: OwnerRetirementReceipt, signedBody: Data, mac: String) throws {
+        lock.lock(); defer { lock.unlock() }
+        guard let chunk = chunk(id), receipt.validates(chunk), signedBody.count <= SealedTransport.maxResponseBytes,
+              [id.uuidString.lowercased() + ".caf", id.uuidString.lowercased() + ".m4a"].contains(chunk.fileName) else { throw StoreError.receiptMismatch }
+        let recovery = directory.appendingPathComponent("owner-deletion-recovery", isDirectory: true)
+        try FileManager.default.createDirectory(at: recovery, withIntermediateDirectories: true)
+        let proof = try JSONSerialization.data(withJSONObject: ["purpose": "owner_deletion", "body_base64": signedBody.base64EncodedString(), "mac_base64": mac])
+        let proofURL = recovery.appendingPathComponent(id.uuidString.lowercased() + ".retired.json")
+        try proof.write(to: proofURL, options: .atomic)
+        let f = try FileHandle(forWritingTo: proofURL); try f.synchronize(); try f.close()
+        // Persist terminal state first. If a move is interrupted, bytes remain locally recoverable and cannot reupload.
+        try mutate(id) { $0.state = .cleared; $0.lastError = "已按确认的删除请求停止上传，本机保留可恢复原音" }
+        let names = [chunk.fileName] + (chunk.recoveryFileName.map { [$0] } ?? [])
+        for name in names {
+            let source = directory.appendingPathComponent(name), target = recovery.appendingPathComponent(name)
+            if FileManager.default.fileExists(atPath: source.path) {
+                if FileManager.default.fileExists(atPath: target.path) { continue } // Never overwrite recoverable bytes.
+                try FileManager.default.moveItem(at: source, to: target)
+            }
+        }
+    }
     public func clearReceivedAudio(_ id: UUID) throws {
         lock.lock(); defer { lock.unlock() }
         guard let chunk = chunk(id), chunk.state == .received else { throw StoreError.invalidState }

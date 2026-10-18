@@ -31,6 +31,7 @@ sys.path.insert(0, str(REPO / 'receiver'))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from platform_store import replace, sync_directory, lock_exclusive  # noqa: E402
 import asr_worker  # noqa: E402
+from retirement_bridge import source_guard, protected_pull  # noqa: E402
 
 EXTS = {'.m4a', '.wav', '.mp3', '.aac', '.flac', '.ogg', '.mp4', '.caf'}
 NOTE_DIR = '录音资料'
@@ -213,6 +214,7 @@ def run_asr():
                 _processor.process(source)
 
 
+@protected_pull
 def pull(sha, dest):
     dest.mkdir(parents=True, exist_ok=True)
     for name in ['receipt.json', 'transcript.json', 'transcript.md']:
@@ -349,6 +351,13 @@ def sync_documents(db, doc_ids=None):
 # ---------------------------------------------------------------- one recording
 
 def process(db, path, capture_date, is_test=False, source_url=None, no_lark=None, original_name=None, date_basis='explicit', app_metadata=None):
+    sha,_=hash_stable(path)
+    with source_guard(sha) as retired:
+        if retired:return {'source_id':sha,'capture_date':capture_date,'status':'retired','publication_status':'owner_deleted'}
+        return _process_unretired(db,path,capture_date,is_test,source_url,no_lark,original_name,date_basis,app_metadata)
+
+
+def _process_unretired(db, path, capture_date, is_test=False, source_url=None, no_lark=None, original_name=None, date_basis='explicit', app_metadata=None):
     use_feishu = FEISHU if no_lark is None else not no_lark
     date_valid(capture_date)
     original_name = original_name or path.name

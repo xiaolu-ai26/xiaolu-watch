@@ -38,13 +38,26 @@ def utterances(rows):
             start, end = part.get('start'), part.get('end')
             timed = finite_number(start) and finite_number(end) and 0 <= start < end <= row.duration + 1
             sentences = [s.strip() for s in re.split(r'(?<=[。！？!?；;])\s*|(?<=\.)\s+(?=[A-Z])', text) if s.strip()]
+            word_cursor = 0
+            words = part.get('words') or []
+            aligned_text = ''.join(w.get('word', '') for w in words).strip()
+            alignment_valid = aligned_text == text and all(finite_number(w.get('start')) and finite_number(w.get('end')) and 0 <= w['start'] < w['end'] <= row.duration + 1 for w in words)
             for sentence_index, sentence in enumerate(sentences):
+                sentence_start, sentence_end, precision = start, end, 'asr_parent_span' if timed else 'unknown'
+                if alignment_valid:
+                    selected = []; assembled = ''
+                    while word_cursor < len(words) and len(assembled.strip()) < len(sentence):
+                        word = words[word_cursor]; selected.append(word); assembled += word['word']; word_cursor += 1
+                    if assembled.strip() == sentence and selected:
+                        sentence_start, sentence_end, precision = selected[0]['start'], selected[-1]['end'], 'asr_word_span'
+                    else:
+                        alignment_valid = False
                 unit = {'i': len(units), 'text': sentence, 'source_id': row.source_id, 'source_receipt_hash': row.receipt_hash,
                         'asr_segment_index': segment_index, 'sentence_index': sentence_index,
-                        'time_precision': 'asr_parent_span' if timed else 'unknown',
-                        'start': start if timed else None, 'end': end if timed else None,
-                        'absolute_start': row.captured + start if timed else None,
-                        'absolute_end': row.captured + end if timed else None, 'owner': 'unknown', 'speaker_reason': 'unconfigured'}
+                        'time_precision': precision,
+                        'start': sentence_start if timed else None, 'end': sentence_end if timed else None,
+                        'absolute_start': row.captured + sentence_start if timed else None,
+                        'absolute_end': row.captured + sentence_end if timed else None, 'owner': 'unknown', 'speaker_reason': 'unconfigured'}
                 units.append(unit)
     for i, unit in enumerate(units):
         prior = units[i-1] if i else None
@@ -142,7 +155,8 @@ def materialize(value, units, batch_id, previous=None):
         body = group['distilled'].strip().split('\n', 1)[1].lstrip()
         distilled.append('## ' + visible_title + '\n\n' + caption + '\n\n' + body)
         metadata.append({'id': identifier, 'title': title, 'continuation': continuing, 'indices': group['indices'],
-                         'clean_fragment': group['clean'],
+                         'clean_fragment': group['clean'], 'distilled_fragment': group['distilled'],
+                         'clean_rendered': clean[-1], 'distilled_rendered': distilled[-1],
                          'started_at': previous.get('started_at') if continuing else next((u['absolute_start'] for u in subset if u['absolute_start'] is not None), None),
                          'window_count': previous.get('window_count', 1) + 1 if continuing else 1,
                          'owner_caption': caption, 'source_spans': [{k: u[k] for k in ('source_id', 'source_receipt_hash', 'asr_segment_index', 'sentence_index', 'time_precision', 'start', 'end', 'absolute_start', 'absolute_end', 'owner', 'speaker_reason')} for u in subset]})

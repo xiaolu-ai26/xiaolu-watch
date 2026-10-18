@@ -308,6 +308,14 @@ final class WatchDirectUploader: NSObject, ObservableObject, URLSessionDataDeleg
                       let challenge = request.value(forHTTPHeaderField: "X-Watch-Challenge") else { throw TransportError.incompleteAttempt }
                 _ = try attempts.validateBoundTask(id, taskID: task.taskIdentifier, originalURL: url, httpMethod: method,
                     challengeHeader: challenge, configuration: c, checkCiphertext: false, session: scope)
+                if r.statusCode == 410 {
+                    let mac = r.value(forHTTPHeaderField: "X-Watch-Retirement-MAC")
+                    let retired = try SealedTransport.verifyRetirement(body, macBase64: mac, statusCode: r.statusCode, attempt: a, configuration: c)
+                    try store.retireOwnerDeleted(event, receipt: retired, signedBody: body, mac: mac!)
+                    try? attempts.finish(id, succeeded: true)
+                    PairingDiagnostics.record("watch_owner_retirement_verified", ["kind": scope.kind])
+                    return
+                }
                 let receipt = try SealedTransport.verifyReceipt(body, macBase64: r.value(forHTTPHeaderField: "X-Watch-Receipt-MAC"),
                     statusCode: r.statusCode, attempt: a, configuration: c)
                 try store.acknowledgeServer(event, receipt: receipt, statusCode: r.statusCode)

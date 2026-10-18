@@ -37,5 +37,15 @@
 	<array>
 		<string>UIInterfaceOrientationPortrait</string>
 	</array>
+	<key>NSHealthShareUsageDescription</key>
+	<string>经你开启后，读取可用的心率、HRV、睡眠、步数和运动记录，作为独立身体背景，不据此诊断或推断对话原因。</string>
+	<key>NSLocationWhenInUseUsageDescription</key>
+	<string>经你开启后，记录大致区域，帮助回看录音时的背景，不持续采集精确轨迹。</string>
+	<key>NSLocationAlwaysAndWhenInUseUsageDescription</key>
+	<string>经你选择始终允许后，在后台接收大致停留和区域变化事件，系统可能延迟更新。</string>
+	<key>UIBackgroundModes</key>
+	<array>
+		<string>location</string>
+	</array>
 </dict>
 </plist>

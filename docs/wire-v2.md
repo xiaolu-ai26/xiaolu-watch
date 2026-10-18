@@ -61,3 +61,31 @@ GET /health仅无私密摘要，不发送pairing_secret，不用于Keychain配�
 ## 验证层次
 
 Swift CryptoKit与Python cryptography的确定性公开测试vector、真实HTTP加密fixture、wrong-key/bitflip/path/challenge/旧ACK/生产明文拒收是协议验收。它们不代替真机后台 URLSession、手表采集、设备安装、耗电或中断恢复验收。
+
+## Authenticated owner-deletion retirement (optional receiver capability)
+
+Audio encryption and durable stored ACK are unchanged. After authenticating a valid
+sealed request and its metadata/audio SHA, a receiver with an owner deletion
+source tombstone may return HTTP 410 with `Cache-Control: no-store` and
+`X-Watch-Retirement-MAC`. It must not attach `X-Watch-Receipt-MAC`, `stored:true`,
+or claim that retired audio was durably stored again.
+
+The JSON body binds `schema_version:2`, `protocol:"watch-memory-chunks-v2"`,
+`purpose:"owner_deletion"`, `retired:true`, `source_id`, `sha256`, `chunk_id`,
+`session_id`, `sequence`, and canonical UUID `deletion_id`. Both SHA fields equal
+this request's authenticated original audio SHA. Tombstones apply to original
+source replay, not to all other cards that previously shared the source.
+
+Derive a separate 32-byte HKDF-SHA256 key from the canonical pairing-secret UTF-8
+bytes, salt `watch-memory-v2`, info `retirement-authentication`. The MAC is base64
+HMAC-SHA256 over these exact bytes:
+
+```
+watch-memory-retired-v2\n{challenge}\n{cipherSHA256}\n410\n{raw JSON response bytes}
+```
+
+The client must verify the current attempt/configuration, HTTP 410, MAC purpose,
+challenge, sealed-body SHA and every original chunk identity field before moving
+its local chunk into a recoverable retirement area. This creates a separate
+retirement receipt, never a stored ACK. A bare/invalid 410 preserves the original
+and retry state; old clients may need an update to understand this capability.

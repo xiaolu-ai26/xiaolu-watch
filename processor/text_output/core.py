@@ -50,7 +50,7 @@ class Source:
         return {k: getattr(self, k) for k in ('source_id', 'session', 'sequence', 'date', 'captured', 'duration', 'text_hash', 'asr_model', 'receipt_hash')}
 
 
-def discover(asr_root, sessions_root, capture_since=None, derived_asr_root=None, derived_asr_model=None):
+def discover(asr_root, sessions_root, capture_since=None, derived_asr_root=None, derived_asr_model=None, retired_source_ids=()):
     """Join committed receiver metadata to committed ASR. Pending slots stay explicit."""
     groups = {}
     if derived_asr_root is not None and (not isinstance(derived_asr_model, str) or not derived_asr_model.strip()):
@@ -75,6 +75,9 @@ def discover(asr_root, sessions_root, capture_since=None, derived_asr_root=None,
         group = groups.setdefault((date, session), {})
         if seq in group:
             raise ValueError('duplicate recording sequence')
+        if source_id in retired_source_ids:
+            group[seq] = Source(source_id, session, seq, date, timestamp.timestamp(), float(m['duration_s']), '', digest('source_retired'), 'source_retired', '')
+            continue
         if capture_since is not None and timestamp.timestamp() < capture_since:
             # Metadata-only retirement: old missing/failed ASR must not block newer sequence slots.
             group[seq] = Source(source_id, session, seq, date, timestamp.timestamp(), float(m['duration_s']), '', digest('capture_excluded'), 'capture_excluded', '')
@@ -107,7 +110,7 @@ def discover(asr_root, sessions_root, capture_since=None, derived_asr_root=None,
                 text = '\n'.join(s['text'].strip() for s in raw['segments']).strip()
                 if len(text) > 100_000:
                     raise ValueError('single transcript too large')
-                segments = tuple({'text': s['text'], 'start': s.get('start'), 'end': s.get('end')} for s in raw['segments'])
+                segments = tuple({'text': s['text'], 'start': s.get('start'), 'end': s.get('end'), 'words': s.get('words', [])} for s in raw['segments'])
                 item = Source(source_id, session, seq, date, timestamp.timestamp(), float(m['duration_s']), text, digest(text), str(raw.get('model', '')), hashlib.sha256(receipt.read_bytes()).hexdigest(), segments)
         group[seq] = item
     return groups

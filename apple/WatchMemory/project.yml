@@ -39,6 +39,11 @@ targets:
         CFBundleVersion: '1'
         UILaunchScreen: {}
         UIApplicationSupportsIndirectInputEvents: true
+        NSHealthShareUsageDescription: 经你开启后，读取可用的心率、HRV、睡眠、步数和运动记录，作为独立身体背景，不据此诊断或推断对话原因。
+        NSLocationWhenInUseUsageDescription: 经你开启后，记录大致区域，帮助回看录音时的背景，不持续采集精确轨迹。
+        NSLocationAlwaysAndWhenInUseUsageDescription: 经你选择始终允许后，在后台接收大致停留和区域变化事件，系统可能延迟更新。
+        UIBackgroundModes:
+          - location
         NSCameraUsageDescription: 扫描你自己的处理电脑提供的连接二维码。
         NSLocalNetworkUsageDescription: 将手表录音发送到你设置的家庭处理电脑。
         NSAppTransportSecurity:
@@ -47,6 +52,7 @@ targets:
           - UIInterfaceOrientationPortrait
     settings:
       base:
+        CODE_SIGN_ENTITLEMENTS: PhoneApp/Phone.entitlements
         PRODUCT_BUNDLE_IDENTIFIER: $(XIAOLU_WATCH_BUNDLE_ID)
         TARGETED_DEVICE_FAMILY: '1'
         SUPPORTS_MACCATALYST: NO

@@ -21,7 +21,7 @@ def source(n, text='我可能下周再试，唔系今日决定。', captured=100
 
 class FakeLark:
     def __init__(self, home):
-        self.home = home; self.items = []; self.writes = 0; self.fail_after_insert = False
+        self.home = home; self.items = []; self.ids = []; self.next_id = 0; self.writes = 0; self.fail_after_insert = False
 
     def command(self, args):
         op = args[0]
@@ -31,17 +31,27 @@ class FakeLark:
         if op == '+script':
             return {'ok': True, 'data': {'assessment': {'status': 'pass'}}}
         if op == '+fetch':
-            content = ''.join(f'<{tag} id="id{i}">{text}</{tag}>' for i, (tag, text) in enumerate(self.items))
+            while len(self.ids) < len(self.items):
+                self.ids.append('id'+str(self.next_id)); self.next_id += 1
+            content = ''.join(f'<{tag} id="{self.ids[i]}">{text}</{tag}>' for i, (tag, text) in enumerate(self.items))
             return {'ok': True, 'data': {'document': {'content': content}}}
+        if op == '+update' and args[args.index('--command')+1] == 'block_delete':
+            index = self.ids.index(args[args.index('--block-id')+1]); self.items.pop(index); self.ids.pop(index); self.writes += 1
+            if self.fail_after_insert:
+                self.fail_after_insert = False
+                raise RuntimeError('simulated delete response lost after server commit')
+            return {'ok':True,'data':{'result':'success','warnings':[]}}
         path = self.home / args[args.index('--content') + 1][3:]
         parsed = document_blocks(path.read_text())
         insert = [(x['tag'], x['text']) for x in parsed]
         self.writes += 1
         if op == '+create':
             self.items = insert
+            self.ids = ['id'+str(i) for i in range(self.next_id, self.next_id+len(insert))]; self.next_id += len(insert)
             return {'ok': True, 'data': {'document': {'document_id': 'fake-doc', 'url': 'https://example.invalid/doc'}, 'warnings': []}}
-        index = int(args[args.index('--block-id') + 1][2:]) + 1
+        index = self.ids.index(args[args.index('--block-id') + 1]) + 1
         self.items[index:index] = insert
+        self.ids[index:index] = ['id'+str(i) for i in range(self.next_id, self.next_id+len(insert))]; self.next_id += len(insert)
         if self.fail_after_insert:
             self.fail_after_insert = False
             raise RuntimeError('simulated response lost after server commit')
@@ -329,12 +339,12 @@ class WorkerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             root=Path(td);config=self.setup_fixture(root);config['feishu']=True
             p=Provider();w=Worker(config,p,Publisher())
-            with self.assertRaises(RuntimeError):w.tick(2e9)
+            self.assertTrue(w.tick(2e9)['sink_conflicts'])
             self.assertTrue((root/'notes/manifest.json').exists())
             # Simulate crash/loss of the last local result; cloud still unavailable on restart.
             for note in (root/'notes').rglob('*.md'):note.unlink()
             (root/'notes/manifest.json').unlink();w.state.close();w=Worker(config,p,Publisher())
-            with self.assertRaises(RuntimeError):w.tick(2e9)
+            self.assertTrue(w.tick(2e9)['sink_conflicts'])
             self.assertTrue((root/'notes/manifest.json').exists());self.assertEqual(p.calls,1);w.state.close()
 
     def test_quota_denial_does_not_consume_three_provider_attempts(self):

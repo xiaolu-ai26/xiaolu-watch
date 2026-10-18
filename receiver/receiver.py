@@ -255,7 +255,8 @@ class Store:
 class Server(ThreadingHTTPServer):
     daemon_threads=True
     request_queue_size=8
-    def __init__(self,address,store,token,allow_legacy_fixture=False,ffprobe_path=None):
+    def __init__(self,address,store,token,allow_legacy_fixture=False,ffprobe_path=None,context_store=None):
+        self.context_store=context_store
         self.ffprobe_path=ffprobe_path
         self.store,self.token=store,token;self.pairing_secret=token;self.allow_legacy_fixture=allow_legacy_fixture;self.connection_slots=store.connection_slots
         super().__init__(address,Handler)
@@ -294,6 +295,19 @@ class Handler(BaseHTTPRequestHandler):
             self.send_response(status);self.send_header('Content-Type','application/json');self.send_header('Content-Length',str(len(payload)));self.send_header('Connection','close')
             if context:self.send_header('X-Watch-Receipt-MAC',wire_v2.receipt_mac(self.server.pairing_secret,context[0],context[1],status,payload))
             self.end_headers();self.wfile.write(payload)
+    def reply_retirement(self,meta,record):
+        body={'schema_version':2,'protocol':wire_v2.PROTOCOL,'purpose':'owner_deletion','retired':True,'source_id':meta['sha256'],'sha256':meta['sha256'],'chunk_id':meta['chunk_id'],'session_id':meta['session_id'],'sequence':meta['sequence'],'deletion_id':record['deletion_id']}
+        payload=json.dumps(body,separators=(',',':')).encode('utf-8');challenge,cipher_sha=self.v2_context
+        self.close_connection=True
+        with contextlib.suppress(OSError):
+            self.send_response_only(410);self.send_header('Content-Type','application/json');self.send_header('Content-Length',str(len(payload)));self.send_header('Cache-Control','no-store');self.send_header('Connection','close');self.send_header('X-Watch-Retirement-MAC',wire_v2.retirement_mac(self.server.pairing_secret,challenge,cipher_sha,payload));self.end_headers();self.wfile.write(payload)
+    def commit_v2(self,path,meta):
+        ledger=self.server.context_store
+        guard=ledger.generation_guard(timeout=15) if ledger else contextlib.nullcontext()
+        with guard:
+            record=ledger.retirement_for(meta['sha256']) if ledger else None
+            if record:self.reply_retirement(meta,record);return
+            status,result=self.server.store.commit(path,meta);self.reply(status,result)
     def authorized(self):
         return hmac.compare_digest(self.headers.get('Authorization','').encode('utf-8'),('Bearer '+self.server.token).encode('utf-8'))
     def do_GET(self):
@@ -375,7 +389,7 @@ class Handler(BaseHTTPRequestHandler):
                 os.chmod(audio_path,0o600);f.write(audio);f.flush();os.fsync(f.fileno())
             del audio
             media_check(audio_path,meta,self.server.ffprobe_path)
-            status,result=self.server.store.commit(audio_path,meta);self.reply(status,result)
+            self.commit_v2(audio_path,meta)
         except wire_v2.WireError as exc:self.reply(401 if str(exc)=='invalid_seal' else 400,{'stored':False,'error':str(exc)})
         except RequestError as exc:self.reply(exc.status,{'stored':False,'error':exc.code})
         except (socket.timeout,TimeoutError):self.reply(408,{'stored':False,'error':'upload_timeout'})
@@ -408,10 +422,14 @@ def main():
     if any(not private_address(ip) for ip in config['bind_addresses']):raise RuntimeError('Refusing non-private bind')
     with (ROOT/'private/receiver.lock').open('a+') as lock:
         lock_exclusive(lock)
+        ledger=None
+        if config.get('context_root'):
+            from context_store import ContextStore
+            ledger=ContextStore(config['context_root'])
         store=Store(ROOT,config.get('max_local_bytes',2*1024**3),config.get('minimum_free_bytes',2*1024**3));store.gc_enabled=config.get('gc_enabled',False);servers=[]
         for address in config['bind_addresses']:
             try:
-                server=Server((address,config['port']),store,config['pairing_secret'],ffprobe_path=ffprobe);servers.append(server);threading.Thread(target=server.serve_forever,daemon=True).start()
+                server=Server((address,config['port']),store,config['pairing_secret'],ffprobe_path=ffprobe,context_store=ledger);servers.append(server);threading.Thread(target=server.serve_forever,daemon=True).start()
                 print(json.dumps({'event':'listening','address':address,'port':config['port']}),flush=True)
             except OSError:print(json.dumps({'event':'private_interface_unavailable','address':address}),flush=True)
         if not servers:raise RuntimeError('No configured private interface is currently bindable')

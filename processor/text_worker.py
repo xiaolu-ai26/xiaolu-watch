@@ -18,6 +18,8 @@ from text_output.speaker_labels import attach as attach_speaker_labels
 from text_output.lark_output import Lark
 from text_output.provider import DeepSeek
 from text_output.store import State, TokenBudgetExceeded, atomic, singleton
+from context_analysis import retirement
+from context_analysis.reading import filter_batch
 
 
 def hash_file(path):
@@ -48,8 +50,9 @@ class Worker:
         self.publisher = publisher or (Lark(self.state, self.home) if config.get('feishu') is True else None)
 
     def _saved_batches(self, date):
-        batches = [v for _, v in self.state.items('batch:') if v['date'] == date and v.get('output') and self._eligible(v)]
-        return sorted(batches, key=lambda x: (x['captured'], x['session'], x['sequence']))
+        deleted = retirement.snapshot(self.config)['group_ids']
+        batches = [filter_batch(v, deleted) for _, v in self.state.items('batch:') if v['date'] == date and v.get('output') and self._eligible(v)]
+        return sorted([b for b in batches if b['output']['clean'] or b['output']['distilled']], key=lambda x: (x['captured'], x['session'], x['sequence']))
 
     def _eligible(self, batch):
         if self.capture_floor is None:
@@ -59,9 +62,13 @@ class Worker:
         return bool(sources) and all(type(s.get('captured')) in (int, float) and math.isfinite(s['captured'])
                                      and s['captured'] >= self.capture_floor for s in sources)
 
+    @retirement.guarded
     def export(self, date):
+        generation = retirement.snapshot(self.config)['generation']
         batches = self._saved_batches(date)
         if not batches:
+            self._retire_empty_notes(date)
+            self.manifest()
             return
         for kind, directory in [('clean', NOTE_SCOPES[0]), ('distilled', NOTE_SCOPES[1])]:
             body = daily_markdown(date, kind, [b['output'] for b in batches])
@@ -70,10 +77,83 @@ class Worker:
             expected_hash = hashlib.sha256(body.encode()).hexdigest()
             if target.exists() and (target.is_symlink() or hash_file(target) not in (previous, expected_hash)):
                 raise RuntimeError('text_outbox_human_edit_preserved')
+            retirement.check(self.config, generation)
             atomic(target, body)
             self.state.put('note:' + str(target), hash_file(target))
+            relative = directory + '/' + target.name
+            self.state.put('deleted_notes', [x for x in self.state.get('deleted_notes', []) if x['relative_path'] != relative])
         self.manifest()
 
+    def _retire_empty_notes(self, date):
+        deleted = self.state.get('deleted_notes', [])
+        for directory in NOTE_SCOPES:
+            target = self.notes / directory / (date + '_' + directory + '.md')
+            prior = self.state.get('note:' + str(target))
+            if not prior:
+                continue
+            if target.exists():
+                if target.is_symlink() or hash_file(target) != prior:
+                    raise RuntimeError('deleted_note_human_edit_preserved')
+                trash = self.home / 'deleted-notes' / directory / target.name
+                trash.parent.mkdir(parents=True, exist_ok=True)
+                target.replace(trash)
+            item = {'relative_path': directory + '/' + target.name, 'sha256': prior}
+            if item not in deleted:
+                deleted.append(item)
+        self.state.put('deleted_notes', deleted)
+
+    @retirement.guarded
+    def reconcile_deletions(self):
+        snap = retirement.snapshot(self.config)
+        if not snap['group_ids']:
+            return
+        dates = sorted({b['date'] for _, b in self.state.items('batch:') if b.get('output') and self._eligible(b)})
+        for key, batch in self.state.items('batch:'):
+            if batch.get('output') and self._eligible(batch):
+                for group in batch.get('conversation_groups', []):
+                    if group['id'] in snap['group_ids']:
+                        date_key = 'retired-group-dates:'+group['id']
+                        self.state.put(date_key, sorted(set(self.state.get(date_key, [])) | {batch['date']}))
+                filtered = filter_batch(batch, snap['group_ids'])
+                if filtered != batch:
+                    self.state.put(key, filtered)
+        # Invalidate summaries that might contain retired content; never send them as future context.
+        for key, value in self.state.items('overview:'):
+            if 'input_group_ids' not in value or any(group_id in value['input_group_ids'] for group_id in snap['group_ids']):
+                self.state.put(key, {'retired': True, 'attempts': 3})
+        local_failures = []; cloud_failures = []
+        for date in dates:
+            try:
+                self.export(date)
+                self.state.put('local-delete-conflict:'+date, None)
+            except Exception as error:
+                local_failures.append(date)
+                self.state.put('local-delete-conflict:'+date, {'generation': snap['generation'], 'reason': type(error).__name__})
+            if self.publisher and self.state.get('cloud-retired:'+date) != snap['generation']:
+                try:
+                    retirement.check(self.config, snap['generation'])
+                    self.publisher.remove_retired_blocks(date, [b['output'] for b in self._saved_batches(date) if b.get('published')], snap['group_ids'])
+                    self.state.put('cloud-retired:'+date, snap['generation'])
+                    self.state.put('cloud-delete-conflict:'+date, None)
+                except Exception as error:
+                    cloud_failures.append(date)
+                    self.state.put('cloud-delete-conflict:'+date, {'generation': snap['generation'], 'reason': type(error).__name__})
+        ledger = retirement.store(self.config)
+        if ledger:
+            ack_path = self.notes / 'consumer-ack.json'
+            ack = json.loads(ack_path.read_text(encoding='utf-8')) if ack_path.is_file() and not ack_path.is_symlink() else {}
+            manifest = json.loads((self.notes / 'manifest.json').read_text(encoding='utf-8')) if (self.notes / 'manifest.json').exists() else {}
+            notes_done = (not local_failures and ack.get('generation') == snap['generation'] and ack.get('manifest_revision') == manifest.get('manifest_revision') and ack.get('files') == manifest.get('files') and ack.get('deleted') == manifest.get('deleted') and not ack.get('conflicts'))
+            for transaction in snap.get('transactions', []):
+                transaction_id = transaction.get('transaction_id') or transaction.get('deletion_id') or transaction.get('id')
+                if transaction_id:
+                    ledger.report_derivative_stage(transaction_id, 'processed_text', 'done', 'managed_outputs_reconciled')
+                    affected_dates = {date for group in transaction.get('group_ids', []) for date in self.state.get('retired-group-dates:'+group, [])}
+                    affected_conflicts = [date for date in cloud_failures if date in affected_dates]
+                    ledger.report_derivative_stage(transaction_id, 'cloud', 'retryable_failed' if affected_conflicts else 'done', {'conflicting_dates': affected_conflicts})
+                    ledger.report_derivative_stage(transaction_id, 'notes', 'done' if notes_done else 'retryable_failed' if ack.get('conflicts') or local_failures else 'pending', 'consumer_ack_verified' if notes_done else 'consumer_conflict_preserved' if ack.get('conflicts') or local_failures else 'waiting_for_consumer_ack')
+
+    @retirement.guarded
     def manifest(self):
         files = []
         eligible_dates = {b['date'] for _, b in self.state.items('batch:') if b.get('output') and self._eligible(b)}
@@ -90,29 +170,73 @@ class Worker:
                 if hash_file(path) != expected:
                     continue  # Never advertise an older same-day mixed body before export replaces it.
                 files.append({'relative_path': directory + '/' + path.name, 'sha256': expected, 'bytes': path.stat().st_size})
-        atomic(self.notes / 'manifest.json', {'version': 1, 'kind': 'dual-text', 'generated_at': time.time(), 'files': files})
+        value = {'version': 1, 'kind': 'dual-text', 'files': files,
+                 'deleted': self.state.get('deleted_notes', []), 'generation': retirement.snapshot(self.config)['generation']}
+        if {x['relative_path'] for x in files} & {x['relative_path'] for x in value['deleted']}:
+            raise RuntimeError('deleted_note_still_active')
+        value['manifest_revision'] = digest(value)
+        value['generated_at'] = time.time()
+        atomic(self.notes / 'manifest.json', value)
 
+    @retirement.guarded
     def _publish(self, batch):
         if not batch.get('output') or not self._eligible(batch):
             return
-        # Independent sink: a cloud failure must never block local durable notes.
-        self.export(batch['date'])
+        snap = retirement.snapshot(self.config)
+        batch = filter_batch(batch, snap['group_ids'])
+        if not batch['output']['clean'] and not batch['output']['distilled']:
+            return
+        # Sink conflicts are durable per-date status; neither blocks fresh ASR text.
+        try:
+            self.export(batch['date'])
+            self.state.put('sink-local:'+batch['date'], None)
+        except Exception as error:
+            self.state.put('sink-local:'+batch['date'], {'reason': type(error).__name__})
         if self.publisher and not batch.get('published'):
-            output = dict(batch['output'], id=batch['id'])
-            day = self.publisher.append(batch['date'], output)
+            if self.state.get('cloud-delete-conflict:'+batch['date']):
+                return
+            output = dict(batch['output'], id=batch['id'], _groups=batch.get('conversation_groups', []))
+            retirement.check(self.config, snap['generation'])
+            try:
+                day = self.publisher.append(batch['date'], output)
+            except Exception as error:
+                self.state.put('sink-cloud:'+batch['date'], {'reason': type(error).__name__})
+                return
             batch.update(published=True, document_id=day['id'], document_url=day.get('url', ''))
             self.state.put('batch:' + batch['id'], batch)
+            self.state.put('sink-cloud:'+batch['date'], None)
+
+    @retirement.guarded
+    def _record_error(self, key, error):
+        # Never write a captured batch object after releasing a publication guard.
+        # Deletion may have scrubbed it in the meantime. Merge fixed error metadata
+        # into the CURRENT record, preserving all current retirement edits.
+        current = self.state.get(key)
+        if current is None:
+            return
+        current['last_error'] = getattr(error, 'code', type(error).__name__)
+        if isinstance(error, TokenBudgetExceeded):
+            current['attempts'] = max(0, current.get('attempts', 0)-1)
+            tomorrow = dt.datetime.now(dt.timezone.utc).date() + dt.timedelta(days=1)
+            current['retry_after'] = dt.datetime.combine(tomorrow, dt.time(), dt.timezone.utc).timestamp()+60
+        self.state.put(key, current)
 
     def tick(self, clock=None):
         now = time.time() if clock is None else clock
         since = self.capture_floor
+        self.reconcile_deletions()
+        generation = retirement.snapshot(self.config)['generation']
         groups = discover(self.config['asr_outbox'], self.config['receiver_sessions'], capture_since=since,
-                          derived_asr_root=self.config.get('derived_asr_outbox'), derived_asr_model=self.config.get('derived_asr_model'))
+                          derived_asr_root=self.config.get('derived_asr_outbox'), derived_asr_model=self.config.get('derived_asr_model'),
+                          retired_source_ids=retirement.snapshot(self.config).get('retired_raw_source_ids', []))
         self.manifest()  # Even with no new audio, retire stale manifest entries without deleting files.
         # First finish generated but unpublished artifacts. Never call the provider again.
         # Local artifacts are independently recoverable even after cloud published=True.
         for date in sorted({b['date'] for _, b in self.state.items('batch:') if b.get('output') and self._eligible(b)}):
-            self.export(date)
+            try:
+                self.export(date)
+            except Exception as error:
+                self.state.put('sink-local:'+date, {'reason': type(error).__name__})
         for _, batch in self.state.items('batch:'):
             if batch.get('output') and self._eligible(batch) and (not batch.get('published') or not self.publisher):
                 self._publish(batch)
@@ -120,6 +244,7 @@ class Worker:
         for (date, session), slots in sorted(groups.items()):
             cursor_key = 'consumed:' + date + ':' + session
             consumed = set(self.state.get(cursor_key, [])) if since is None else set()
+            consumed.update(seq for seq, item in slots.items() if item is not None and item.asr_model == 'source_retired')
             floor = 0
             if slots and min(slots) > 0 and any(min(slots)-1 in other for (d,s),other in groups.items() if s==session and d!=date):
                 floor = min(slots)  # A committed previous-day predecessor proves the midnight boundary.
@@ -149,9 +274,10 @@ class Worker:
             if batch.get('attempts', 0) >= 3 or batch.get('retry_after', 0) > now:
                 continue
             if not any(r.text for r in rows):
-                batch['no_speech'] = True
-                self.state.put(key, batch)
-                self.state.put(cursor_key, sorted(consumed | {r.sequence for r in rows}))
+                with retirement.guard(self.config, generation):
+                    batch['no_speech'] = True
+                    self.state.put(key, batch)
+                    self.state.put(cursor_key, sorted(consumed | {r.sequence for r in rows}))
                 continue
             previous = [b for b in self._saved_batches(date) if b['session'] == session and b['sequence'] < rows[0].sequence]
             context = previous[-1]['raw_tail'] if previous else ''
@@ -174,28 +300,25 @@ class Worker:
                     conversation_previous = prior['conversation_groups'][-1]
                     context = prior['raw_tail']
             # Persist the attempt before network I/O; crashes count toward the retry ceiling too.
-            batch.update(attempts=batch['attempts'] + 1, retry_after=now + 600)
-            self.state.put(key, batch)
+            with retirement.guard(self.config, generation):
+                batch.update(attempts=batch['attempts'] + 1, retry_after=now + 600)
+                self.state.put(key, batch)
             try:
                 if self.conversation_mode:
-                    grouped, provenance = self.provider.edit_conversations(rows, units, conversation_previous, context)
+                    grouped, provenance = retirement.request(self.provider, lambda: self.provider.edit_conversations(rows, units, conversation_previous, context), self.config, generation,
+                        group_ids=[conversation_previous['id']] if conversation_previous else [], source_ids=[row.source_id for row in rows])
                     output, group_sidecar = materialize(grouped, units, identity, conversation_previous)
                     batch.update(conversation_schema=GROUP_SCHEMA, conversation_groups=group_sidecar, speaker=speaker_state)
                 else:
-                    output, provenance = self.provider.edit(rows, context)
-                batch.update(output=output, provider=provenance, raw_tail=''.join(r.text for r in rows)[-600:], generated_at=time.time(), last_error=None)
-                self.state.put(key, batch)
-                self.state.put(cursor_key, sorted(consumed | {r.sequence for r in rows}))
-                self._publish(batch)
+                    output, provenance = retirement.request(self.provider, lambda: self.provider.edit(rows, context), self.config, generation, source_ids=[row.source_id for row in rows])
+                with retirement.guard(self.config, generation):
+                    batch.update(output=output, provider=provenance, raw_tail=''.join(r.text for r in rows)[-600:], generated_at=time.time(), last_error=None)
+                    self.state.put(key, batch)
+                    self.state.put(cursor_key, sorted(consumed | {r.sequence for r in rows}))
+                    self._publish(batch)
                 completed += 1
             except Exception as e:
-                # Never persist provider error bodies or arbitrary transcript-bearing exception strings.
-                batch['last_error'] = getattr(e, 'code', type(e).__name__)
-                if isinstance(e, TokenBudgetExceeded):
-                    batch['attempts'] -= 1  # Admission denied: no provider request was made.
-                    tomorrow = dt.datetime.now(dt.timezone.utc).date() + dt.timedelta(days=1)
-                    batch['retry_after'] = dt.datetime.combine(tomorrow, dt.time(), dt.timezone.utc).timestamp() + 60
-                self.state.put(key, batch)
+                self._record_error(key, e)
                 raise
             if completed >= int(self.config.get('max_batches_per_tick', 2)):
                 break
@@ -204,7 +327,8 @@ class Worker:
                    if not b.get('output') and b.get('last_error') and self._eligible(b)]
         return {'new_batches': completed, 'days': len({k[0] for k in groups}), 'blocked_batches': blocked,
                 'speaker_waiting_windows': speaker_waiting, 'speaker_unknown_units': unknown_units,
-                'speaker_reasons': speaker_reasons, 'conversation_mode': self.conversation_mode}
+                'speaker_reasons': speaker_reasons, 'conversation_mode': self.conversation_mode,
+                'sink_conflicts': [key for prefix in ('sink-', 'cloud-delete-conflict:', 'local-delete-conflict:') for key,value in self.state.items(prefix) if value]}
 
 
 def main():
@@ -229,7 +353,7 @@ def main():
             while True:
                 try:
                     result = worker.tick()
-                    atomic(home / 'status.json', {'checked_at': time.time(), 'status': 'blocked' if result['blocked_batches'] else 'ok', **result,
+                    atomic(home / 'status.json', {'checked_at': time.time(), 'status': 'blocked' if result['blocked_batches'] or result['sink_conflicts'] else 'ok', **result,
                         'provider_budget': worker.state.budget(dt.datetime.now(dt.timezone.utc).date().isoformat())})
                 except Exception as e:
                     atomic(home / 'status.json', {'checked_at': time.time(), 'status': 'retry_or_operator_review', 'error_type': type(e).__name__,

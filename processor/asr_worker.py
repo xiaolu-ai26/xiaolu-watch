@@ -121,7 +121,7 @@ class Processor:
                 '-i', str(source), '-t', str(audio_end - audio_start), '-ar', '16000', '-ac', '1',
                 '-c:a', 'pcm_s16le', str(wav))
             options = dict(language=self.args.language, task='transcribe', beam_size=5,
-                           vad_filter=True, condition_on_previous_text=False,
+                           vad_filter=True, condition_on_previous_text=False, word_timestamps=True,
                            vad_parameters={'min_silence_duration_ms': 500})
             if supports_multilingual:
                 options['multilingual'] = use_multilingual
@@ -139,6 +139,7 @@ class Processor:
                                      'text': s.text.strip(), 'avg_logprob': round(s.avg_logprob, 4),
                                      'no_speech_prob': round(s.no_speech_prob, 4),
                                      'compression_ratio': round(s.compression_ratio, 4),
+                                     'words': [{'word': w.word, 'start': round(audio_start+w.start, 3), 'end': round(min(audio_start+w.end, duration), 3)} for w in (getattr(s, 'words', None) or [])],
                                      **({'language': s.language} if getattr(s, 'language', None) else {})})
         return duration, segments
 
@@ -166,6 +167,23 @@ class Processor:
             os.replace(sidecar, archived_sidecar)
 
     def process(self, source):
+        context_root = getattr(self.args, 'context_root', None) or os.environ.get('WATCH_MEMORY_CONTEXT_ROOT')
+        if not context_root:
+            return self._process_unretired(source)
+        # Deployment provides the same receiver-owned store and process lock.
+        base = Path(__file__).resolve().parent.parent
+        for directory in (base / 'receiver', base / 'receiver_windows', base / 'app_receiver'):
+            if directory.is_dir():
+                sys.path.insert(0, str(directory))
+        from context_store import ContextStore
+        ledger = ContextStore(context_root)
+        with ledger.generation_guard(timeout=60) as snapshot:
+            if sha256(source) in snapshot['retired_raw_source_ids']:
+                print(json.dumps({'status': 'retired_source_skipped'}), flush=True)
+                return
+            return self._process_unretired(source)
+
+    def _process_unretired(self, source):
         root = self.args.root
         source_id = sha256(source)
         target = root / 'outbox' / source_id
