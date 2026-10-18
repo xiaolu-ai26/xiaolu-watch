@@ -107,3 +107,68 @@ class QueueTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+class RetirementInferenceTests(unittest.TestCase):
+    def prepare(self, root):
+        import sys
+        sys.path.insert(0,str(Path(__file__).resolve().parents[2]/'receiver'))
+        from context_store import ContextStore
+        for name in ('inbox','outbox','state','work'):(root/name).mkdir()
+        source=root/'inbox/public-fixture.wav';source.write_bytes(b'public-synthetic-fixture')
+        args=SimpleNamespace(root=root,model='test-local',language='zh',capture_date='2026-01-08',context_root=root/'context')
+        return source,worker.Processor(args),ContextStore(root/'context')
+
+    def test_slow_inference_releases_context_lock_and_retired_result_cannot_return(self):
+        import threading
+        with tempfile.TemporaryDirectory() as td:
+            root=Path(td);source,processor,ledger=self.prepare(root);sid=worker.sha256(source)
+            entered=threading.Event();release=threading.Event();errors=[]
+            def infer(*args):
+                entered.set();release.wait(3)
+                return 1,[{'start':0,'end':1,'text':'公开合成内容'}]
+            processor.transcribe=infer
+            def run():
+                try:
+                    with worker.exclusive_lock(root):processor.process(source)
+                except Exception as error:errors.append(type(error).__name__)
+            thread=threading.Thread(target=run);thread.start();self.assertTrue(entered.wait(2))
+            # ASR's worker OS lock remains held, but independent context/delete work proceeds.
+            with ledger.generation_guard(timeout=.2):
+                with ledger.connect() as db:
+                    db.execute("UPDATE meta SET v=1 WHERE k='generation'")
+                    db.execute('INSERT INTO source_tombstones VALUES(?,?,?,?,1)',(sid,'fixture','pending','[]'))
+                (root/'state'/(sid+'.json')).unlink()  # Simulate backend retiring its ASR state.
+            release.set();thread.join(3)
+            self.assertFalse(thread.is_alive());self.assertEqual(errors,[])
+            self.assertFalse((root/'outbox'/sid/'receipt.json').exists())
+            self.assertFalse((root/'state'/(sid+'.json')).exists())
+            self.assertTrue(source.exists())
+
+    def test_unrelated_generation_change_discards_then_live_source_retries(self):
+        with tempfile.TemporaryDirectory() as td:
+            root=Path(td);source,processor,ledger=self.prepare(root);sid=worker.sha256(source)
+            def infer(*args):
+                with ledger.generation_guard(timeout=.2):
+                    with ledger.connect() as db:db.execute("UPDATE meta SET v=1 WHERE k='generation'")
+                return 1,[{'start':0,'end':1,'text':'公开合成内容'}]
+            processor.transcribe=infer;processor.process(source)
+            state=json.loads((root/'state'/(sid+'.json')).read_text())
+            self.assertEqual(state['status'],'failed');self.assertEqual(state['segments'],[])
+            self.assertFalse((root/'outbox'/sid/'receipt.json').exists());self.assertTrue(source.exists())
+            processor.transcribe=lambda *args:(1,[{'start':0,'end':1,'text':'公开合成内容'}])
+            processor.process(source)
+            self.assertEqual(json.loads((root/'outbox'/sid/'receipt.json').read_text())['status'],'done')
+
+    def test_inference_error_after_retirement_does_not_recreate_state(self):
+        with tempfile.TemporaryDirectory() as td:
+            root=Path(td);source,processor,ledger=self.prepare(root);sid=worker.sha256(source)
+            def infer(*args):
+                with ledger.generation_guard(timeout=.2):
+                    with ledger.connect() as db:
+                        db.execute("UPDATE meta SET v=1 WHERE k='generation'")
+                        db.execute('INSERT INTO source_tombstones VALUES(?,?,?,?,1)',(sid,'fixture','pending','[]'))
+                    (root/'state'/(sid+'.json')).unlink()
+                raise RuntimeError('synthetic inference failure')
+            processor.transcribe=infer;processor.process(source)
+            self.assertFalse((root/'state'/(sid+'.json')).exists())
+            self.assertFalse((root/'outbox'/sid).exists())

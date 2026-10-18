@@ -67,6 +67,10 @@ def markdown(data):
     lines += [f'[{s["start"]:.2f}–{s["end"]:.2f}] {s["text"]}' for s in data['segments']]
     return '\n'.join(lines) + '\n'
 
+class SourceRetired(RuntimeError):
+    pass
+
+
 class Processor:
     def __init__(self, args):
         self.args = args
@@ -99,13 +103,22 @@ class Processor:
         return self.model
 
     def transcribe(self, source, workspace):
+        report = getattr(self, '_phase_callback', None) or (lambda _: None)
+        report('probing')
+        started = time.monotonic()
         duration = float(run('ffprobe', '-v', 'error', '-show_entries', 'format=duration',
                              '-of', 'default=noprint_wrappers=1:nokey=1', str(source)).stdout.strip())
         if not duration > 0:
             raise ValueError('Audio duration must be positive')
         segments = []
         self.language_detection = []
+        self.phase_timings = {'probe_s': round(time.monotonic()-started, 3), 'model_was_cached': self.model is not None}
+        report('model_loading')
+        model_started = time.monotonic()
         model = self.get_model()
+        self.phase_timings['model_ready_s'] = round(time.monotonic()-model_started, 3)
+        report('decoding_and_inference')
+        inference_started = time.monotonic()
         supports_multilingual = "multilingual" in inspect.signature(model.transcribe).parameters
         use_multilingual = bool(getattr(self.args, "multilingual", True) and self.args.language is None and supports_multilingual)
         # Bounded decoding memory even for a full day recording. 1 s context on each seam;
@@ -141,6 +154,7 @@ class Processor:
                                      'compression_ratio': round(s.compression_ratio, 4),
                                      'words': [{'word': w.word, 'start': round(audio_start+w.start, 3), 'end': round(min(audio_start+w.end, duration), 3)} for w in (getattr(s, 'words', None) or [])],
                                      **({'language': s.language} if getattr(s, 'language', None) else {})})
+        self.phase_timings['decode_inference_s'] = round(time.monotonic()-inference_started, 3)
         return duration, segments
 
     def archive(self, source, source_id):
@@ -166,35 +180,127 @@ class Processor:
         if sidecar.exists():
             os.replace(sidecar, archived_sidecar)
 
-    def process(self, source):
+    @contextlib.contextmanager
+    def _source_guard(self, source_id, expected=None):
         context_root = getattr(self.args, 'context_root', None) or os.environ.get('WATCH_MEMORY_CONTEXT_ROOT')
         if not context_root:
-            return self._process_unretired(source)
-        # Deployment provides the same receiver-owned store and process lock.
+            yield None
+            return
         base = Path(__file__).resolve().parent.parent
         for directory in (base / 'receiver', base / 'receiver_windows', base / 'app_receiver'):
             if directory.is_dir():
                 sys.path.insert(0, str(directory))
         from context_store import ContextStore
         ledger = ContextStore(context_root)
-        with ledger.generation_guard(timeout=60) as snapshot:
-            if sha256(source) in snapshot['retired_raw_source_ids']:
-                print(json.dumps({'status': 'retired_source_skipped'}), flush=True)
-                return
-            return self._process_unretired(source)
+        with ledger.generation_guard(expected, timeout=30) as snapshot:
+            if source_id in snapshot['retired_raw_source_ids']:
+                raise SourceRetired('retired_source_processing_denied')
+            yield snapshot['generation']
 
-    def _process_unretired(self, source):
+    def process(self, source):
+        # Caller retains the ASR worker OS lock. Never hold the context lock during
+        # decoding, model loading, CUDA inference, or waiting for a subprocess.
+        try:
+            source_id = sha256(source)
+            with self._source_guard(source_id) as generation:
+                prepared = self._prepare(source, source_id)
+        except (SourceRetired, FileNotFoundError):
+            print(json.dumps({'status': 'retired_or_removed_source_skipped'}), flush=True)
+            return
+        if prepared is None:
+            return
+        root, target, state_file, base, metadata_error = prepared
+        begin = time.monotonic()
+
+        def phase(name):
+            base['phase'] = name
+            with self._source_guard(source_id, generation):
+                atomic_json(state_file, base)
+
+        def deadline():
+            # A deadline never recreates a retired source's state/transcript.
+            try:
+                with self._source_guard(source_id, generation):
+                    atomic_json(state_file, dict(base, status='failed', segments=[],
+                        error='JobDeadlineExceeded: worker terminated; rerun to retry'))
+            except Exception:
+                pass
+            finally:
+                os._exit(124)
+        timer = threading.Timer(getattr(self.args, 'job_timeout', 3600), deadline)
+        timer.daemon = True
+        timer.start()
+        self._phase_callback = phase
+        self.phase_timings = {}
+        try:
+            if metadata_error is not None:
+                raise metadata_error
+            with tempfile.TemporaryDirectory(prefix=source_id[:12] + '-', dir=root / 'work') as tmp:
+                duration, segments = self.transcribe(source, Path(tmp))
+            base['requires_human_review'] = True
+            base['quality_flags'] = sorted({flag for seg in segments for flag, condition in (
+                ('low_logprob', seg.get('avg_logprob', 0) < -1),
+                ('high_compression', seg.get('compression_ratio', 0) > 2.4),
+                ('possible_stock_phrase_hallucination', any(x in seg['text'] for x in ('点赞', '订阅', '字幕由', '打赏支持')))) if condition})
+            base['language_detection'] = self.language_detection
+            base['language_detection_note'] = 'Model language probabilities are not transcription accuracy; per-segment language is available only when supplied by the installed library.'
+            base.update(status='done', phase='committing', phase_timings=self.phase_timings,
+                        audio_duration_s=round(duration, 3), segments=segments,
+                        processing_duration_s=round(time.monotonic() - begin, 3), updated_at=datetime.now(TZ).isoformat())
+            # A deletion during inference invalidates the result. Check generation
+            # and source retirement atomically with ALL output/receipt/archive writes.
+            with self._source_guard(source_id, generation):
+                if sha256(source) != source_id:
+                    raise RuntimeError('Input changed during processing; result not committed')
+                target.mkdir(exist_ok=True)
+                atomic_json(target / 'transcript.json', base)
+                md_tmp = target / 'transcript.md.tmp'
+                md_tmp.write_text(markdown(base), encoding='utf-8')
+                os.replace(md_tmp, target / 'transcript.md')
+                atomic_json(target / 'receipt.json', base)
+                atomic_json(state_file, base)
+                try:
+                    self.archive(source, source_id)
+                    base['archive_status'] = 'done'
+                except RuntimeError as exc:
+                    base['archive_status'] = 'conflict'
+                    base['archive_warning'] = str(exc)
+                base['phase'] = 'finished'
+                atomic_json(target / 'receipt.json', base)
+                atomic_json(state_file, base)
+        except Exception as exc:
+            # Error bookkeeping is also retirement-aware and contains no result text.
+            failed = dict(base, status='failed', segments=[], error=f'{type(exc).__name__}: {exc}',
+                          processing_duration_s=round(time.monotonic() - begin, 3), updated_at=datetime.now(TZ).isoformat())
+            try:
+                with self._source_guard(source_id) as current_generation:
+                    if current_generation != generation:
+                        failed['error'] = 'RetirementGenerationChanged: inference result discarded; retry live source'
+                    atomic_json(state_file, failed)
+                base = failed
+            except SourceRetired:
+                base = {'source_id': source_id, 'status': 'retired_result_discarded'}
+            except Exception:
+                base = {'source_id': source_id, 'status': 'result_not_committed_retry'}
+        finally:
+            self._phase_callback = None
+            timer.cancel()
+        print(json.dumps({k: base.get(k) for k in ('source_id', 'status', 'attempts', 'audio_duration_s',
+                                                    'processing_duration_s', 'archive_status', 'error')}
+                         | {'segment_count': len(base.get('segments') or [])}, ensure_ascii=False), flush=True)
+
+    def _prepare(self, source, source_id):
+        """Short guarded metadata/duplicate phase; no model or subprocess calls."""
         root = self.args.root
-        source_id = sha256(source)
         target = root / 'outbox' / source_id
         state_file = root / 'state' / (source_id + '.json')
         previous = json.loads(state_file.read_text(encoding='utf-8')) if state_file.exists() else {}
-        metadata_error = None
+        metadata_error = None; metadata = {}
         try:
             requested_date, requested_name = metadata_for(source, self.args.capture_date)
             sidecar = source.with_suffix(source.suffix + '.json')
-            requested_metadata = json.loads(sidecar.read_text(encoding='utf-8')) if sidecar.exists() else {}
-            if requested_metadata.get('source_id') and requested_metadata['source_id'] != source_id:
+            metadata = json.loads(sidecar.read_text(encoding='utf-8')) if sidecar.exists() else {}
+            if metadata.get('source_id') and metadata['source_id'] != source_id:
                 raise ValueError('Metadata source_id does not match audio SHA256')
         except (ValueError, TypeError) as exc:
             requested_date, requested_name = self.args.capture_date or datetime.now(TZ).date().isoformat(), source.name
@@ -203,89 +309,26 @@ class Processor:
             complete = json.loads((target / 'receipt.json').read_text(encoding='utf-8'))
             if complete.get('status') == 'done' and all((target / n).is_file() for n in ('transcript.json', 'transcript.md')):
                 if (complete.get('capture_date') != requested_date or complete.get('original_name') != requested_name
-                    or bool(complete.get('is_test', False)) != bool(requested_metadata.get('is_test', False))
-                    or complete.get('source_url') != requested_metadata.get('source_url')):
-                    print(json.dumps({'source_id': source_id, 'status': 'metadata_conflict', 'error': 'Same bytes already committed with different metadata; existing receipt preserved'}, ensure_ascii=False), flush=True)
-                    return
+                    or bool(complete.get('is_test', False)) != bool(metadata.get('is_test', False))
+                    or complete.get('source_url') != metadata.get('source_url')):
+                    print(json.dumps({'source_id': source_id, 'status': 'metadata_conflict'}), flush=True)
+                    return None
                 try:
                     self.archive(source, source_id)
-                except RuntimeError as exc:
-                    print(json.dumps({'source_id': source_id, 'status': 'archive_conflict', 'error': str(exc)}, ensure_ascii=False), flush=True)
-                    return
-                print(json.dumps({'source_id': source_id, 'status': 'duplicate'}, ensure_ascii=False), flush=True)
-                return
-        attempts = previous.get('attempts', 0) + 1
-        begin = time.monotonic()
-        base = {'schema_version': 1, 'source_id': source_id, 'status': 'processing',
-                'attempts': attempts, 'original_name': source.name,
-                'capture_date': self.args.capture_date or datetime.now(TZ).date().isoformat(),
-                'audio_duration_s': None, 'processing_duration_s': None,
+                except RuntimeError:
+                    print(json.dumps({'source_id': source_id, 'status': 'archive_conflict'}), flush=True)
+                    return None
+                print(json.dumps({'source_id': source_id, 'status': 'duplicate'}), flush=True)
+                return None
+        base = {'schema_version': 1, 'source_id': source_id, 'status': 'processing', 'phase': 'prepared',
+                'attempts': previous.get('attempts', 0) + 1, 'original_name': requested_name,
+                'capture_date': requested_date, 'audio_duration_s': None, 'processing_duration_s': None,
                 'model': self.args.model, 'language': self.args.language, 'segments': [],
-                'transcript_md': f'outbox/{source_id}/transcript.md',
-                'updated_at': datetime.now(TZ).isoformat()}
+                'transcript_md': f'outbox/{source_id}/transcript.md', 'updated_at': datetime.now(TZ).isoformat(),
+                'capture_date_basis': metadata.get('capture_date_basis') or ('explicit' if metadata.get('capture_date') or self.args.capture_date else 'receive_date_unconfirmed'),
+                'is_test': bool(metadata.get('is_test', False)), 'source_url': metadata.get('source_url')}
         atomic_json(state_file, base)
-        def deadline():
-            failed = dict(base, status='failed', error='JobDeadlineExceeded: worker terminated; rerun to retry')
-            try:
-                atomic_json(state_file, failed)
-            finally:
-                os._exit(124)  # terminate native CUDA/decoder calls and release OS lock
-        timer = threading.Timer(getattr(self.args, 'job_timeout', 3600), deadline)
-        timer.daemon = True
-        timer.start()
-        try:
-            if metadata_error is not None:
-                raise metadata_error
-            base['capture_date'], base['original_name'] = requested_date, requested_name
-            sidecar = source.with_suffix(source.suffix + '.json')
-            metadata = json.loads(sidecar.read_text(encoding='utf-8')) if sidecar.exists() else {}
-            if metadata.get('source_id') and metadata['source_id'] != source_id:
-                raise ValueError('Metadata source_id does not match audio SHA256')
-            base['capture_date_basis'] = metadata.get('capture_date_basis') or ('explicit' if metadata.get('capture_date') or self.args.capture_date else 'receive_date_unconfirmed')
-            base['is_test'] = bool(metadata.get('is_test', False))
-            base['source_url'] = metadata.get('source_url')
-            with tempfile.TemporaryDirectory(prefix=source_id[:12] + '-', dir=root / 'work') as tmp:
-                duration, segments = self.transcribe(source, Path(tmp))
-            # Refuse a file replaced/changed during decoding; uploader must atomically rename .part.
-            if sha256(source) != source_id:
-                raise RuntimeError('Input changed during processing; result not committed')
-            base['requires_human_review'] = True
-            base['quality_flags'] = sorted({flag for seg in segments for flag, condition in (
-                ('low_logprob', seg.get('avg_logprob', 0) < -1),
-                ('high_compression', seg.get('compression_ratio', 0) > 2.4),
-                ('possible_stock_phrase_hallucination', any(x in seg['text'] for x in ('点赞', '订阅', '字幕由', '打赏支持')))) if condition})
-            base['language_detection'] = self.language_detection
-            base['language_detection_note'] = 'Model language probabilities are not transcription accuracy; per-segment language is available only when supplied by the installed library.'
-            base.update(status='done', audio_duration_s=round(duration, 3), segments=segments,
-                        processing_duration_s=round(time.monotonic() - begin, 3),
-                        updated_at=datetime.now(TZ).isoformat())
-            target.mkdir(exist_ok=True)
-            atomic_json(target / 'transcript.json', base)
-            md_tmp = target / 'transcript.md.tmp'
-            md_tmp.write_text(markdown(base), encoding='utf-8')
-            os.replace(md_tmp, target / 'transcript.md')
-            # receipt is the commit marker; client reads only status=done.
-            atomic_json(target / 'receipt.json', base)
-            atomic_json(state_file, base)
-            try:
-                self.archive(source, source_id)
-                base['archive_status'] = 'done'
-            except RuntimeError as exc:
-                base['archive_status'] = 'conflict'
-                base['archive_warning'] = str(exc)
-            atomic_json(target / 'receipt.json', base)
-            atomic_json(state_file, base)
-        except Exception as exc:
-            base.update(status='failed', error=f'{type(exc).__name__}: {exc}',
-                        processing_duration_s=round(time.monotonic() - begin, 3),
-                        updated_at=datetime.now(TZ).isoformat())
-            atomic_json(state_file, base)
-        finally:
-            timer.cancel()
-        # Log a summary only: transcript text never goes to service logs.
-        print(json.dumps({k: base.get(k) for k in ('source_id', 'status', 'attempts', 'audio_duration_s',
-                                                    'processing_duration_s', 'archive_status', 'error')}
-                         | {'segment_count': len(base.get('segments') or [])}, ensure_ascii=False), flush=True)
+        return root, target, state_file, base, metadata_error
 
 @contextlib.contextmanager
 def exclusive_lock(root):
