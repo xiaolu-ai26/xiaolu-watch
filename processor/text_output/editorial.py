@@ -30,7 +30,7 @@ def validate_reading(group, units):
             raise ValueError('reading_exclusion_invalid')
         index=item['index']; reason=item['reason']; text=by_index[index]['text']; norm=normalized(text)
         if reason=='repetition':
-            if not any(i in by_index and normalized(by_index[i]['text'])==norm for i in kept):
+            if not any(i in by_index and repetition_key(by_index[i]['text'])==repetition_key(text) for i in kept):
                 raise ValueError('reading_repetition_without_retained_evidence')
         elif reason=='filler':
             if not re.fullmatch(r'(?:嗯|呃|啊|哦|诶|那个|就是|然后|um|uh|erm|er)+',norm):
@@ -110,3 +110,48 @@ def pure_promotion(text):
         actions=re.findall(action,compact)
         return compact.startswith(('请','欢迎','麻烦','不吝')) or len(actions)>=2
     return bool(re.fullmatch(r'(?:please\s+(?:like\s+and\s+)?subscribe|like\s+and\s+subscribe)(?:\s+to\s+(?:the|our)\s+channel)?[.!]?',raw))
+
+
+def repetition_key(text):
+    # Preserve decimal points, signs, fractions, negation and sentence modality.
+    return re.sub(r'\s+',' ',text).strip()
+
+
+def retain_literal_repetitions(value, units):
+    """Conservatively retain a disputed unit already present in BOTH full drafts.
+
+    This never authorizes an exclusion. The provider response stays untouched;
+    returned actions are private provenance, not reader-facing text.
+    """
+    import copy
+    result=copy.deepcopy(value);actions=[];by_index={u['i']:u['text'] for u in units}
+    def literal(text):
+        return repetition_key(re.sub(r'\*\*([^*]+)\*\*',r'\1',text))
+    def contains(body,unit):
+        body=literal(body);unit=literal(unit)
+        if not unit:return False
+        # Avoid matching an English word inside an unrelated longer word.
+        left=r'(?<![A-Za-z0-9])' if unit[0].isascii() and unit[0].isalnum() else ''
+        right=r'(?![A-Za-z0-9])' if unit[-1].isascii() and unit[-1].isalnum() else ''
+        return bool(re.search(left+re.escape(unit)+right,body))
+    groups=result.get('groups',[]) if isinstance(result,dict) else []
+    if not isinstance(groups,list):return result,actions
+    for group in groups:
+        if not isinstance(group,dict):continue
+        plan=group.get('reading',{})
+        if not isinstance(plan,dict):continue
+        if plan.get('role') not in ('main','unknown') or not isinstance(plan.get('retained_indices'),list) or not isinstance(plan.get('excluded'),list):continue
+        if not isinstance(group.get('clean'),str) or not isinstance(group.get('distilled'),str) or not isinstance(group.get('indices'),list):continue
+        kept=plan['retained_indices'];removed=[]
+        if any(type(i) is not int for i in kept):continue
+        for item in plan['excluded']:
+            index=item.get('index') if isinstance(item,dict) else None
+            text=by_index.get(index) if type(index) is int else None
+            already_proved=bool(text and any(i in by_index and repetition_key(by_index[i])==repetition_key(text) for i in kept))
+            if (isinstance(item,dict) and item.get('reason')=='repetition' and index in group.get('indices',[]) and
+                index not in kept and text and not already_proved and
+                contains(summary_body(group['clean']),text) and contains(summary_body(group['distilled']),text)):
+                kept.append(index);actions.append({'unit_index':index,'original_reason':'repetition','action':'retained_literal_text_in_both_drafts'})
+            else:removed.append(item)
+        plan['retained_indices']=sorted(kept);plan['excluded']=removed
+    return result,actions

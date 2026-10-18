@@ -37,7 +37,7 @@ class ManualProvider:
         return copy.deepcopy(c['value']),{'provider':'codex_reviewed_manual','api_request':False,'admission_id':None,'input_units_hash':c['units_hash'],'manual_value_hash':digest(c['value']),'reviewed_at':c['reviewed_at']}
 
 
-def apply_pending(worker,candidate):
+def apply_pending(worker,candidate,verified_provider=None):
     c=candidate
     if c.get('approved_for_apply') is not True or c.get('provenance')!='codex_reviewed_manual' or c.get('policy')!=READING_POLICY_VERSION:
         raise ValueError('manual_pending_review_required')
@@ -86,7 +86,7 @@ def apply_pending(worker,candidate):
         if not batch.get('output'):
             # Clear only this reviewed batch's budget wait after successful preflight.
             batch.update(retry_after=0,attempts=0);worker.state.put(key,batch)
-    provider=ManualProvider(c)
+    provider=verified_provider or ManualProvider(c)
     try:
         worker.provider=provider;worker.config['max_batches_per_tick']=1
         if batch.get('output'):
