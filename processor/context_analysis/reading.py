@@ -18,7 +18,9 @@ def cards(batches, deleted=()):
             if group['id'] in retired:
                 continue
             card = result.setdefault(group['id'], {'id': group['id'], 'title': group['title'], 'clean': '', 'distilled': '',
-                'owner_label': group['owner_caption'], 'summary_input': '', 'reading_role': 'background', 'embedded_summaries': [], 'editorial_complete': True, 'source_spans': [], 'source_ids': [], 'start_at': None, 'end_at': None})
+                'owner_label': group['owner_caption'], 'summary_input': '', 'reading_role': 'background', 'embedded_summaries': [], 'editorial_complete': True, 'source_spans': [], 'source_ids': [], 'start_at': None, 'end_at': None, '_fragment_count': 0, '_has_continuation': False})
+            card['_fragment_count'] += 1
+            card['_has_continuation'] = card['_has_continuation'] or bool(group.get('continuation'))
             card['clean'] += ('\n\n' if card['clean'] else '') + group['clean_fragment']
             fragment = group.get('distilled_fragment')
             if fragment is None:
@@ -48,7 +50,10 @@ def cards(batches, deleted=()):
         card['source_ids'] = sorted({s['source_id'] for s in spans})
         owners = {s['owner'] for s in spans}
         card['owner_label'] = '疑似本人讲话' if owners == {'self'} else '包含未匹配本人的声音' if 'other' in owners else '归属未确认'
-        card['version'] = hashlib.sha256(json.dumps(card, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+        version_payload={k:v for k,v in card.items() if k not in ('_fragment_count','_has_continuation')}
+        if card['_fragment_count']>1 or card['_has_continuation']:
+            version_payload['summary_scope_policy']='whole-conversation-1'
+        card['version'] = hashlib.sha256(json.dumps(version_payload, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
     return list(result.values())
 
 

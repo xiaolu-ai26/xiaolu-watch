@@ -48,10 +48,11 @@ class Overview:
                 embedded=' '.join(card['embedded_summaries'])
                 if card['reading_role']=='background':
                     card['summary']='';card['summary_state']='background'
-                elif card['editorial_complete'] and embedded and len(embedded)<=220:
+                elif card['_fragment_count']==1 and not card['_has_continuation'] and card['editorial_complete'] and embedded and len(embedded)<=220:
                     card['summary']=embedded;card['summary_state']='ready'
                 else:
-                    summary = self.summary.get([summary_card], 'card:' + card['id'], now, allow_request=self.summary.requests < 1)
+                    scope=('conversation:' if card['_fragment_count']>1 or card['_has_continuation'] else 'card:')+card['id']
+                    summary = self.summary.get([summary_card], scope, now, allow_request=self.summary.requests < 1)
                     card['summary'] = summary['text'] if summary['state']=='ready' else ''
                     card['summary_state'] = summary['state']
             overview = incremental_overview(self.state,self.summary,day_cards,date,now,self.config,snap['generation'])
@@ -80,7 +81,7 @@ class Overview:
             sidecar = {'version': 1, 'cards': []}
             for card in day_cards:
                 spans = card.pop('source_spans'); card.pop('source_ids', None)
-                for private_field in ('summary_input','embedded_summaries','editorial_complete','_content_version'):
+                for private_field in ('summary_input','embedded_summaries','editorial_complete','_content_version','_fragment_count','_has_continuation'):
                     card.pop(private_field, None)
                 card['owner_label'] = 'self' if card['owner_label']=='疑似本人讲话' else 'other' if card['owner_label']=='包含未匹配本人的声音' else 'unknown'
                 public['cards'].append(card)
