@@ -46,3 +46,30 @@ class RetirementBridge(unittest.TestCase):
   def inner(*args,**kwargs):
    with ContextStore(self.ledger.root).generation_guard():return {'status':'nested-ASR-and-pull-safe'}
   with patch.object(pipeline,'_process_unretired',side_effect=inner):self.assertEqual(pipeline.process(self.db,self.audio,'2026-01-01')['status'],'nested-ASR-and-pull-safe')
+ def test_queue_gap_unlocks_other_threads_and_rechecks_before_copy(self):
+  observed=[]
+  def worker():
+   def writer():
+    with ContextStore(self.ledger.root).generation_guard(timeout=.2):observed.append('acquired-during-ASR-queue')
+   t=threading.Thread(target=writer);t.start();t.join(1);self.assertFalse(t.is_alive());self.retire()
+  with patch.object(pipeline,'transfer'),patch.object(pipeline,'run_asr',side_effect=worker),patch.object(pipeline,'pull',side_effect=AssertionError('retired result must not copy')):
+   result=pipeline.process(self.db,self.audio,'2026-01-01')
+  self.assertEqual(observed,['acquired-during-ASR-queue']);self.assertEqual(result['status'],'retired');self.assertFalse((pipeline.HOME/'receipts/2026-01-01'/self.sha/'client-receipt.json').exists())
+ def test_final_copy_provenance_job_ack_share_one_reacquired_guard(self):
+  observed=[];pipeline.PUBLISH_OUTPUTS=False
+  def attempts(expected):
+   def other():
+    try:
+     with ContextStore(self.ledger.root).generation_guard(timeout=.1):observed.append(True)
+    except StoreError:observed.append(False)
+   t=threading.Thread(target=other);t.start();t.join(1);self.assertFalse(t.is_alive());self.assertEqual(observed[-1],expected)
+  receipt={'source_id':self.sha,'capture_date':'2026-01-01','original_name':self.audio.name,'is_test':True,'source_url':None,'capture_date_basis':'explicit','segments':[{'start':0,'end':1,'text':'PUBLIC fixture'}]}
+  def pull(sid,dest):
+   attempts(False)
+   for name in ('receipt.json','transcript.json'):(dest/name).write_text(json.dumps(receipt))
+   return receipt
+  original_save=pipeline.save
+  def save(*args):attempts(False);return original_save(*args)
+  with patch.object(pipeline,'transfer',side_effect=lambda *a,**k:attempts(False)),patch.object(pipeline,'run_asr',side_effect=lambda:attempts(True)),patch.object(pipeline,'pull',side_effect=pull),patch.object(pipeline,'save',side_effect=save):
+   result=pipeline.process(self.db,self.audio,'2026-01-01',is_test=True)
+  self.assertEqual(result['status'],'done');self.assertTrue((pipeline.HOME/'receipts/2026-01-01'/self.sha/'client-receipt.json').is_file());self.assertEqual(observed,[False,True,False,False,False])

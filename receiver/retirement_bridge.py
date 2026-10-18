@@ -23,3 +23,25 @@ def protected_pull(function):
                 raise StoreError('retired_source_copy_denied',410)
             return function(source_id,*args,**kwargs)
     return guarded
+
+class SourceLease:
+    """Commit lease with an explicit unlocked ASR queue interval.
+
+    The ASR worker guards each source itself. Reacquiring here rechecks retirement
+    before copying results or publishing a job ACK; no stale snapshot is reused.
+    """
+    def __init__(self,source_id):self.source_id=source_id;self.manager=None;self.retired=False
+    def acquire(self):
+        manager=source_guard(self.source_id)
+        self.retired=manager.__enter__();self.manager=manager
+    def close(self):
+        if self.manager is not None:
+            manager=self.manager;self.manager=None;manager.__exit__(None,None,None)
+    def run_unlocked(self,callback):
+        self.close()
+        try:return callback()
+        finally:self.acquire()
+    def __enter__(self):self.acquire();return self
+    def __exit__(self,*args):self.close()
+
+def source_lease(source_id):return SourceLease(source_id)

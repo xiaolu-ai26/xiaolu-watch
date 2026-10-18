@@ -31,7 +31,7 @@ sys.path.insert(0, str(REPO / 'receiver'))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from platform_store import replace, sync_directory, lock_exclusive  # noqa: E402
 import asr_worker  # noqa: E402
-from retirement_bridge import source_guard, protected_pull  # noqa: E402
+from retirement_bridge import source_lease, protected_pull  # noqa: E402
 
 EXTS = {'.m4a', '.wav', '.mp3', '.aac', '.flac', '.ogg', '.mp4', '.caf'}
 NOTE_DIR = '录音资料'
@@ -352,12 +352,12 @@ def sync_documents(db, doc_ids=None):
 
 def process(db, path, capture_date, is_test=False, source_url=None, no_lark=None, original_name=None, date_basis='explicit', app_metadata=None):
     sha,_=hash_stable(path)
-    with source_guard(sha) as retired:
-        if retired:return {'source_id':sha,'capture_date':capture_date,'status':'retired','publication_status':'owner_deleted'}
-        return _process_unretired(db,path,capture_date,is_test,source_url,no_lark,original_name,date_basis,app_metadata)
+    with source_lease(sha) as lease:
+        if lease.retired:return {'source_id':sha,'capture_date':capture_date,'status':'retired','publication_status':'owner_deleted'}
+        return _process_unretired(db,path,capture_date,is_test,source_url,no_lark,original_name,date_basis,app_metadata,_lease=lease)
 
 
-def _process_unretired(db, path, capture_date, is_test=False, source_url=None, no_lark=None, original_name=None, date_basis='explicit', app_metadata=None):
+def _process_unretired(db, path, capture_date, is_test=False, source_url=None, no_lark=None, original_name=None, date_basis='explicit', app_metadata=None, _lease=None):
     use_feishu = FEISHU if no_lark is None else not no_lark
     date_valid(capture_date)
     original_name = original_name or path.name
@@ -398,7 +398,10 @@ def _process_unretired(db, path, capture_date, is_test=False, source_url=None, n
             transfer(path, sha, capture_date, is_test, source_url, original_name, date_basis, app_metadata)
             if fingerprint(path) != fp:
                 raise RuntimeError('Input changed while queueing')
-            run_asr()
+            if _lease:
+                _lease.run_unlocked(run_asr)
+                if _lease.retired:return {'source_id':sha,'capture_date':capture_date,'status':'retired','publication_status':'owner_deleted'}
+            else:run_asr()
             receipt = pull(sha, dest)
             if receipt.get('capture_date') != capture_date or receipt.get('original_name') != original_name:
                 raise RuntimeError('ASR receipt capture_date/original_name mismatch; reconcile source provenance')
