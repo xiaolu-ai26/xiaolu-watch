@@ -5,14 +5,16 @@ import math
 import re
 
 from .core import validate_output, next_batch
+from .editorial import READING_POLICY, READING_POLICY_VERSION, validate_reading, summary_body
 
-GROUP_SCHEMA = 'conversation-groups-1'
+GROUP_SCHEMA = 'conversation-groups-2'
 GROUP_POLICY = '''本次用下面groups顶层格式取代旧clean/distilled顶层格式，前面的双稿编辑标准适用于每一组。这是按自然对话整理的版本，不把每60秒文件或处理窗口当成对话。
 输入units每项是不可拆换的语句单元，i是唯一索引，text是录音数据，owner只来自本地验证，gap_before仅是停顿线索。说话人变化不等于新对话，同一人也可换题。按内容真实连续性分组，短想法不能漏，不能把全窗口机械合成一个主题。
 只返回JSON：{"groups":[{"title":"具体自然主题","indices":[0],"continue_previous":false,"clean":"口语清稿正文","distilled":"二级主题标题加完整整理正文"}],"uncertain_terms":[]}。
 groups按原顺序，每项indices必须是连续的新unit索引，所有输入unit恰好出现一次；不能遗漏/重复/重排，禁止自由生成时间、sourceID、人物姓名或身份。只编辑本批units；previous/context只是前文线索，不重新输出旧正文。
 第一组若确实延续previous同一讨论，可continue_previous=true且title必须与previous.title完全相同；其它组必须false。停顿或轮换只是线索，话题未变则延续，内容明显换题则另组。每组必须提供两份完整去杂正文，不能仅摘一句摘要；distilled必须以与title一致的##标题开头。clean不要自行加身份标签或标题。
 同一话题要求具体问题或讨论目的连续，不能只因同一个软件、同一个人或同一个录音session就当成同一对话；多个独立想法应分开，针对同一问题的问答与解释保持一起。
+按完整交谈事件整理，不按每一句的名词或每个小问题切卡。一个来回中的追问、回答、转折、例子、短插话及返回原问题通常仍是同一讨论；只有新的独立事件或讨论目的确实开始才拆组。不要为每句短答都另写一个摘要。无法确认连续性时保留不确定，不凭时间近或同一说话人硬并。previous.retained_context是上一组的净化语义；若本批接着解释其未完论证或回答其问题，第一组继续原title与ID。独立出现的有价值短想法仍单独保留。例如连续说“这个设备还能保修吗”“纸巾递我一下”“保修要带什么凭证”，属于同一保修交谈中的短插话，应保持一组，而不是按纸巾和保修拆三张；若后来明确开始讨论另一项工作，才另开独立组。
 owner为unknown不表示没有内容，也不得由文本猜是谁。两稿中的我保留原话但不是已验证本人观点，身份说明由本地程序添加。
 '''
 GROUP_POLICY += '\n完整合成示例：输入两unit“我打算明天散步。”“不过可能会下雨。”，输出' + json.dumps({
@@ -69,7 +71,7 @@ def utterances(rows):
 def editor_input(units, previous=None, context=''):
     # Deliberate egress allowlist: no audio, embedding, model/profile IDs, scores or timestamps.
     return json.dumps({'units': [{k: u[k] for k in ('i', 'text', 'owner', 'gap_before')} for u in units],
-                       'previous': {'title': previous['title']} if previous else None,
+                       'previous': {'title': previous['title'],'retained_context': previous.get('summary_input',previous.get('distilled_fragment',previous.get('clean_fragment','')))[-1800:]} if previous else None,
                        'context': context[-600:]}, ensure_ascii=False)
 
 
@@ -91,7 +93,7 @@ def choose_window(slots, consumed, now, floor=0, max_seconds=300, max_chars=3500
     return rows if maximum or pauses or trailing or age >= tail_seconds else []
 
 
-def validate_groups(value, units, previous=None, context=''):
+def validate_groups(value, units, previous=None, context='', require_reading=False):
     if not isinstance(value, dict) or set(value) != {'groups', 'uncertain_terms'}:
         raise ValueError('conversation schema invalid')
     groups, terms = value['groups'], value['uncertain_terms']
@@ -99,7 +101,7 @@ def validate_groups(value, units, previous=None, context=''):
         raise ValueError('conversation group count invalid')
     covered = []
     for n, group in enumerate(groups):
-        if not isinstance(group, dict) or set(group) != {'title', 'indices', 'continue_previous', 'clean', 'distilled'}:
+        if not isinstance(group, dict) or not {'title','indices','continue_previous','clean','distilled'}.issubset(group) or set(group)-{'title','indices','continue_previous','clean','distilled','reading'} or (require_reading and 'reading' not in group):
             raise ValueError('conversation group schema invalid')
         title, indices, continuation = group['title'], group['indices'], group['continue_previous']
         if not isinstance(title, str) or not title.strip() or title.strip() in ('主题', '标题', '整理稿', '真实内容主题', '具体自然主题') or len(title) > 60 or re.search(r'[\n\r#<>]|[0-9a-f]{32}', title):
@@ -111,10 +113,13 @@ def validate_groups(value, units, previous=None, context=''):
         if indices != list(range(indices[0], indices[-1] + 1)):
             raise ValueError('conversation indices not contiguous')
         covered.extend(indices)
-        validate_output({'clean': group['clean'], 'distilled': group['distilled'], 'uncertain_terms': terms}, '\n'.join(units[i]['text'] for i in indices))
+        if 'reading' in group:
+            validate_reading(group, units)
+        validation_distilled = group['distilled'] or ('## '+title+'\n\n'+group['clean'])
+        validate_output({'clean': group['clean'], 'distilled': validation_distilled, 'uncertain_terms': terms}, '\n'.join(units[i]['text'] for i in indices))
         if re.search(r'(?m)^#+\s|^(?:Speaker|说话人)\s*\d+\s*[:：]', group['clean']):
             raise ValueError('conversation clean has generated labels or headings')
-        if group['distilled'].strip().split('\n', 1)[0] != '## ' + title:
+        if group['distilled'].strip() and group['distilled'].strip().split('\n', 1)[0] != '## ' + title:
             raise ValueError('conversation title does not match body')
         # Reject obvious replay of a long prior passage absent from the new units.
         normal = lambda x: re.sub(r'\s+', '', x)
@@ -151,13 +156,15 @@ def materialize(value, units, batch_id, previous=None):
         title = group['title']
         visible_title = title + '（续）' if continuing else title
         caption = owner_caption(subset)
-        clean.append('## ' + visible_title + '\n\n' + caption + '\n\n' + group['clean'].strip())
-        body = group['distilled'].strip().split('\n', 1)[1].lstrip()
-        distilled.append('## ' + visible_title + '\n\n' + caption + '\n\n' + body)
+        clean.append('## ' + visible_title + '\n\n' + group['clean'].strip())
+        body = group['distilled'].strip().split('\n', 1)[1].lstrip() if group['distilled'].strip() else ''
+        distilled.append('## ' + visible_title + '\n\n' + body if body else '')
         metadata.append({'id': identifier, 'title': title, 'continuation': continuing, 'indices': group['indices'],
                          'clean_fragment': group['clean'], 'distilled_fragment': group['distilled'],
                          'clean_rendered': clean[-1], 'distilled_rendered': distilled[-1],
                          'started_at': previous.get('started_at') if continuing else next((u['absolute_start'] for u in subset if u['absolute_start'] is not None), None),
                          'window_count': previous.get('window_count', 1) + 1 if continuing else 1,
-                         'owner_caption': caption, 'source_spans': [{k: u[k] for k in ('source_id', 'source_receipt_hash', 'asr_segment_index', 'sentence_index', 'time_precision', 'start', 'end', 'absolute_start', 'absolute_end', 'owner', 'speaker_reason')} for u in subset]})
-    return {'clean': '\n\n'.join(clean), 'distilled': '\n\n'.join(distilled), 'uncertain_terms': value['uncertain_terms']}, metadata
+                         'owner_caption': caption, 'reading': group.get('reading'), 'reading_version': READING_POLICY_VERSION if group.get('reading') else None,
+                         'summary_input': summary_body(group['distilled']),
+                         'reading_units': [{k:u[k] for k in ('i','source_id','source_receipt_hash','asr_segment_index','sentence_index','start','end')} for u in subset] if group.get('reading') else [], 'source_spans': [{k: u[k] for k in ('source_id', 'source_receipt_hash', 'asr_segment_index', 'sentence_index', 'time_precision', 'start', 'end', 'absolute_start', 'absolute_end', 'owner', 'speaker_reason')} for u in subset]})
+    return {'clean': '\n\n'.join(clean), 'distilled': '\n\n'.join(x for x in distilled if x), 'uncertain_terms': value['uncertain_terms']}, metadata

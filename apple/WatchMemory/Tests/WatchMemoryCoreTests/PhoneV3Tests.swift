@@ -65,4 +65,67 @@ final class PhoneV3Tests: XCTestCase {
             capturedEpoch: reenabledEpoch, currentEpoch: reenabledEpoch, enabled: true, now: now))
     }
 
+    func testReadingMetadataIsOptionalAndCannotInventMeasuredTimeOrHideUnknown() throws {
+        let card: [String: Any] = ["id": "public-reading", "version": 1, "title": "A brief idea", "summary": "Try walking.",
+            "start_at": "2026-01-01T10:00:00Z", "end_at": "2026-01-01T10:01:00Z", "owner_label": "unknown", "clean": "Try walking.", "distilled": "## Walking\nTry walking."]
+        var object: [String: Any] = ["version": 3, "date": "2026-01-01", "timezone": "Asia/Taipei", "generated_at": "2026-01-01T11:00:00Z", "revision": 1,
+            "overview": ["state": "ready", "text": "A brief idea."], "body": ["state": "unknown", "lines": [], "sample_count": 0], "coverage": [], "cards": [card]]
+        func decode() throws -> PhoneToday { try PhoneToday.decode(JSONSerialization.data(withJSONObject: object), requestedDay: "2026-01-01") }
+        let legacy = try decode()
+        XCTAssertNil(legacy.body.measuredThroughAt)
+        XCTAssertTrue(legacy.cards[0].isMainReading)
+        var rich = card; rich["reading_role"] = "unknown"; rich["summary_state"] = "pending"
+        object["cards"] = [rich]
+        XCTAssertTrue(try decode().cards[0].isMainReading)
+        rich["reading_role"] = "background"; object["cards"] = [rich]
+        XCTAssertFalse(try decode().cards[0].isMainReading)
+        rich["reading_role"] = "exclude_unknown_owner"; object["cards"] = [rich]
+        XCTAssertThrowsError(try decode())
+        object["cards"] = [card]
+        object["body"] = ["state": "unknown", "lines": [], "sample_count": 0, "measured_through_at": "not-a-measurement"]
+        XCTAssertThrowsError(try decode())
+        object["body"] = ["state": "unknown", "lines": [], "sample_count": 0]
+        object["overview"] = ["state": "ready", "text": "A brief idea.", "is_partial": true,
+            "coverage_start_at": "2026-01-01T11:00:00Z", "coverage_end_at": "2026-01-01T10:00:00Z"]
+        XCTAssertThrowsError(try decode())
+    }
+
+    func testReadingOrderUsesEventEndAndHourJumpRemainsNearest() throws {
+        func card(_ id: String, _ start: String, _ end: String) -> [String: Any] {
+            ["id": id, "version": 1, "title": "Public fixture", "summary": "A public idea.",
+             "start_at": start, "end_at": end, "owner_label": "unknown", "clean": "Public text.", "distilled": "Public text."]
+        }
+        let object: [String: Any] = ["version": 3, "date": "2026-01-01", "timezone": "UTC",
+            "generated_at": "2026-01-01T20:00:00Z", "revision": 1,
+            "overview": ["state": "ready", "text": "Public overview."],
+            "body": ["state": "unknown", "lines": [], "sample_count": 0], "coverage": [],
+            "cards": [card("old", "2026-01-01T09:00:00Z", "2026-01-01T09:05:00Z"),
+                      card("new", "2026-01-01T12:00:00Z", "2026-01-01T12:05:00Z"),
+                      card("middle", "2026-01-01T10:00:00Z", "2026-01-01T10:05:00Z")]]
+        let today = try PhoneToday.decode(JSONSerialization.data(withJSONObject: object), requestedDay: "2026-01-01")
+        XCTAssertEqual(today.cardsNewestFirst.map(\.id), ["new", "middle", "old"])
+        XCTAssertEqual(today.card(atOrAfter: PhoneV3Policy.date("2026-01-01T09:30:00Z")!)?.id, "middle")
+        XCTAssertEqual(today.card(atOrAfter: PhoneV3Policy.date("2026-01-01T12:03:00Z")!)?.id, "new")
+        XCTAssertNil(today.card(atOrAfter: PhoneV3Policy.date("2026-01-01T12:06:00Z")!))
+        XCTAssertEqual(today.card(atOrAfter: PhoneV3Policy.date("2026-01-01T09:30:00Z")!, excluding: "middle")?.id, "new")
+    }
+
+    func testIngestionProgressIsOptionalAndValidatesStageFields() throws {
+        var object: [String: Any] = ["version": 3, "date": "2026-01-01", "timezone": "UTC",
+            "generated_at": "2026-01-01T20:00:00Z", "revision": 1,
+            "overview": ["state": "ready", "text": "Public overview."],
+            "body": ["state": "unknown", "lines": [], "sample_count": 0], "coverage": [], "cards": []]
+        func decode() throws -> PhoneToday { try PhoneToday.decode(JSONSerialization.data(withJSONObject: object), requestedDay: "2026-01-01") }
+        XCTAssertNil(try decode().ingestion)
+        var progress: [String: Any] = ["latest_recorded_at": "2026-01-01T18:07:00Z", "latest_transcribed_at": "2026-01-01T18:06:00Z",
+            "latest_organized_at": "2026-01-01T15:09:00Z", "received_count": 10, "transcribed_count": 9,
+            "queued_text_count": 3, "queued_asr_count": 1, "state": "budget_wait"]
+        object["ingestion"] = progress
+        XCTAssertEqual(try decode().ingestion?.latestRecordedAt, "2026-01-01T18:07:00Z")
+        XCTAssertEqual(try decode().ingestion?.queuedTextCount, 3)
+        progress["queued_text_count"] = -1; object["ingestion"] = progress; XCTAssertThrowsError(try decode())
+        progress["queued_text_count"] = 3; progress["latest_recorded_at"] = "unknown"; object["ingestion"] = progress
+        XCTAssertThrowsError(try decode())
+    }
+
 }

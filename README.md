@@ -22,6 +22,7 @@ flowchart LR
 - 基础模式可按片段导出笔记；可选双稿与自然对话模式按内容组织文字，保留底层 ASR 和来源记录。
 - 可选的双版本文字层：把相邻转写整理成每日“口语清稿”和“七删一改整理稿”，正文隐藏机器标识；启用时会向 DeepSeek 官方 API 发送转写文字并产生文字处理费用。配置、原文保留和验收边界见[双版本输出](docs/dual-text-output.md)。
 - iPhone 伴侣 App 提供安装／连接设置，以及可选的今日阅读页、只读健康和大致地点采集；手表仍直接上传，不要求手机作音频必经中转。Phone v3 的权限、数据边界和验收状态见[今日页说明](docs/phone-today.md)。
+- 今日阅读按录音事件最新时间排列，并把录音接收、转写与整理进度分开。文字整理按交谈连续性保留原分组，可信完成响应按实际用量结算预算预留；详见[处理进度与预算](docs/health-today.md#processing-progress-and-daily-budget-accounting)。
 
 ## 两种部署方式，选一种
 
@@ -116,6 +117,7 @@ docs/                部署、App 编译安装、排障、加密协议
 - [docs/deployment.md](docs/deployment.md)：两种接收端的部署、HTTPS 入口、后台服务、显卡、存储与回滚
 - [docs/dual-text-output.md](docs/dual-text-output.md)：可选口语清稿、七删一改、DeepSeek 费用边界与双版本输出
 - [docs/conversation-owner.md](docs/conversation-owner.md)：自然对话分组与本地本人声音识别的实现边界、隐私和验收说明
+- [docs/reading-flow.md](docs/reading-flow.md)：原生暖白阅读页、持续向上流动的 Metal 半调背景、动态生命周期与验证边界
 - [docs/phone-today.md](docs/phone-today.md)：iPhone 今日页、健康／大致地点、数据边界、对话回收及原生验收状态
 - [docs/apple-build.md](docs/apple-build.md)：编译安装手表 App、首次配对
 - [docs/troubleshooting.md](docs/troubleshooting.md)：Xcode 连不上手表、VPN 冲突等真实踩坑

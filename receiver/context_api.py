@@ -24,10 +24,49 @@ def public_today(value,day,retired):
     result['body']={k:value['body'][k] for k in ('state','lines','sample_count')}
     result['coverage']=[{k:r[k] for k in ('start_at','end_at','state')} for r in value['coverage']]
     result['cards']=[{k:r[k] for k in ('id','version','title','summary','start_at','end_at','owner_label','clean','distilled')} for r in value['cards'] if r['id'] not in retired]
+    def optional_time(source, target, field):
+        if field not in source:
+            return
+        value=source[field]
+        if value is not None:
+            try:
+                if not isinstance(value,str) or len(value)>64 or dt.datetime.fromisoformat(value.replace('Z','+00:00')).tzinfo is None:
+                    raise ValueError()
+            except (ValueError,TypeError):raise StoreError('projection_unavailable',503)
+        target[field]=value
+    for field in ('coverage_start_at','coverage_end_at','updated_at'):
+        optional_time(value['overview'],result['overview'],field)
+    for field in ('covered_card_count','pending_card_count'):
+        if field in value['overview']:
+            number=value['overview'][field]
+            if type(number) is not int or not 0<=number<=100000:raise StoreError('projection_unavailable',503)
+            result['overview'][field]=number
+    if 'is_partial' in value['overview']:
+        if type(value['overview']['is_partial']) is not bool:raise StoreError('projection_unavailable',503)
+        result['overview']['is_partial']=value['overview']['is_partial']
+    optional_time(value['body'],result['body'],'measured_through_at')
+    if 'ingestion' in value:
+        ingestion=value['ingestion']
+        if not isinstance(ingestion,dict) or ingestion.get('state') not in ('empty','processing','budget_wait','up_to_date'):raise StoreError('projection_unavailable',503)
+        target={'state':ingestion['state']}
+        for field in ('latest_recorded_at','latest_transcribed_at','latest_organized_at'):optional_time(ingestion,target,field)
+        for field in ('received_count','transcribed_count','queued_text_count','queued_asr_count'):
+            number=ingestion.get(field)
+            if type(number) is not int or not 0<=number<=100000:raise StoreError('projection_unavailable',503)
+            target[field]=number
+        result['ingestion']=target
+
+    originals={card['id']:card for card in value['cards']}
+    for card in result['cards']:
+        original=originals[card['id']]
+        for field,allowed in (('reading_role',('main','background','unknown')),('summary_state',('ready','pending','background','failed'))):
+            if field in original:
+                if original[field] not in allowed:raise StoreError('projection_unavailable',503)
+                card[field]=original[field]
     # Cached summaries may still mention a deleted card. Hide them until processor
     # publishes a generation-bound projection, never resurrect an old cache read.
     if retired and value.get('retirement_generation',-1)<retired.generation:
-        result['overview']={'state':'pending','text':''}
+        result['overview']={'state':'pending','text':'','is_partial':True,'covered_card_count':0,'pending_card_count':len(result['cards']),'coverage_start_at':None,'coverage_end_at':None,'updated_at':None}
         for card in result['cards']:card['summary']=''
     return result
 

@@ -52,3 +52,31 @@ Mac 拉取支持清单墓碑，只回收仍匹配自身已管理哈希的文件�
 ## 验证与边界
 
 自动化测试覆盖缺数据／混杂场景、测量分池、退休序号与冷启动、摘要在途结果丢弃、真实发送边界互斥、重复正文的 block 身份、共享对话保留和 Mac 消费回执。合成数据通过不等于用户真机健康／位置授权完成，也不等于实际日常压力准确率得到验证。最终安装需在真实设备上由用户完成系统授权后检查数据到达。
+
+## 保留语义与增量概览
+
+阅读编辑新增私有保留计划，将每个输入单元标为保留或有明确原因的冗余／填词／寒暄／推广。短句、未知归属、他人完整讲解和疑似媒体来源都不能作为删除有意义内容的理由。声纹标签保留在详情元数据，正文不再逐段重复“归属未确认”。摘要依据整理稿实际保留的语义，不能重新引入已经剔除的推广。
+
+Phone v3 增加可选字段，旧 App 可忽略：`cards.reading_role`（main/background/unknown）、`cards.summary_state`；日概览包括实际覆盖起止、更新时刻、是否部分完成及已覆盖／待处理数量；身体背景 `measured_through_at` 使用实际健康样本结束时间，缺测量为 null，不取投影刷新时间。
+
+新卡尚未处理不会阻断已完成内容的概览。有效的旧覆盖可在增量处理中继续阅读，通常十分钟合并一次新覆盖，减少文案抖动；修订或删除使依赖失效时立即更新。后台仍沿用同一费用账本和上限，不为新版本重置预算。
+
+## 经确认重新整理某一天
+
+`processor/reprocess_reading.py` 分候选和应用两个阶段，原音和 ASR 不变：
+
+```sh
+python processor/reprocess_reading.py --config /private/text-output.json --date YYYY-MM-DD --candidate-dir /private/revision-candidate
+```
+
+候选存放于私有目录，保留 source/group 身份和精确删除范围。先备份状态与原批次，随后用现有费用账本生成净化候选；必须人工检查语义、短想法、他人内容、推广处理和旧问题对照。审核通过后，才将候选 JSON 的 `approved_for_apply` 标为 true 并执行 `--apply-reviewed`。
+
+应用时要先让正式文字 worker 进入安全停止状态，以取得同一 worker OS 锁。飞书只替换经过完整身份／内容／格式核验的两段受管正文范围，保留文档和章节标题，不调用整篇 overwrite。发现手工内容、资源或样式变化则停止该云操作，保留冲突。来源版本、截止时间或删除 generation 变化会使候选失效。失败或未知外部结果需要回读检查，不应盲目重发。核对云文档、受管本地两稿与新概览后，再结束本次整理。
+
+### Processing progress and daily budget accounting
+
+The optional `ingestion` projection separates received audio, completed local ASR and organized text. `latest_recorded_at` and `latest_transcribed_at` are the end times of the latest audio events committed at those stages. `latest_organized_at` is a continuous event-time frontier: it does not skip an earlier pending source, and empty ASR sources count as confirmed no speech. None of these fields is a current microphone indicator or the projection refresh time. Counts refer to unique sources, exclude retired/test input and expose no source identities. States are `empty`, `processing`, `budget_wait` and `up_to_date`; `queued_text_count` includes budget-blocked text. Overview coverage remains independent.
+
+Provider admission reserves a bounded worst-case allowance atomically. Completed, model-matched `stop` responses with internally consistent integer token usage can settle that allowance to the actual total in an append-only `admission_settlements` table. Existing admission history remains unchanged. Missing, malformed or non-`stop` outcomes retain the full reservation; cache-hit input remains part of prompt tokens, and reasoning remains part of completion tokens. Neither is counted twice or discounted. Settlement and admission share SQLite `BEGIN IMMEDIATE` transactions, and repeated settlement cannot release the same allowance twice. The daily limit and model effort do not change.
+
+Natural grouping treats question/answer exchanges, examples, short interruptions and a return to the same problem as one discussion where the content supports continuity. The provider receives up to 1,800 characters of retained previous-group context in addition to a bounded raw tail. A confirmed continuation reuses the existing group ID; transport file boundaries do not create a new conversation by themselves. Existing historical group IDs and deletion ranges are not automatically merged by proximity.

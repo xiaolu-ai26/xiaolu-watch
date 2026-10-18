@@ -1,102 +1,234 @@
 import SwiftUI
 import WatchMemoryCore
 
+private struct FlowFrameKey: PreferenceKey {
+    static var defaultValue: CGRect = .zero
+    static func reduce(value: inout CGRect, nextValue: () -> CGRect) { value = nextValue() }
+}
+
 struct TodayHome: View {
     @EnvironmentObject private var model: TodayCoordinator
-    @EnvironmentObject private var recorder: PhoneCoordinator
+    @Environment(\.scenePhase) private var scenePhase
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.dynamicTypeSize) private var typeSize
+    @State private var systemMotionLimited = ReadingMotionBudget.systemLimited
+    @State private var flowVisible = false
+    @Namespace private var flow
     @State private var selectedDate = Date()
     @State private var settings = false
+    @State private var dates = false
     @State private var hours = false
+    @State private var showAll = false
+    @State private var bodyExpanded = false
+    private var motionLimited: Bool { reduceMotion || systemMotionLimited || scenePhase != .active }
     private var day: String {
         let f = DateFormatter(); f.calendar = Calendar(identifier: .gregorian); f.locale = Locale(identifier: "en_US_POSIX")
         f.timeZone = .current; f.dateFormat = "yyyy-MM-dd"; return f.string(from: selectedDate)
     }
+    private var cards: [PhoneToday.Card] { (model.today?.cardsNewestFirst ?? []).filter { $0.id != model.deletionStatus?.cardId } }
+    private var visibleCards: [PhoneToday.Card] { showAll ? cards : cards.filter(\.isMainReading) }
+    private var featured: PhoneToday.Card? { visibleCards.first }
     var body: some View {
         NavigationStack {
-            ScrollViewReader { proxy in
-                ScrollView {
-                    VStack(alignment: .leading, spacing: 20) {
-                        DatePicker("查看日期", selection: $selectedDate, displayedComponents: .date)
-                            .datePickerStyle(.compact).accessibilityHint("切换到其他日期查看历史记录")
-                        VStack(alignment: .leading, spacing: 10) {
-                            Label("录音覆盖与处理进度", systemImage: "waveform")
-                            Text(model.readStatus).font(.footnote).foregroundStyle(.secondary)
-                            Button { hours = true } label: { CoverageStrip(coverage: model.today?.coverage ?? [], day: selectedDate) }
-                                .buttonStyle(.plain).accessibilityLabel("查看每小时录音覆盖")
-                        }
-                        if !model.connected {
-                            VStack(alignment: .leading, spacing: 8) {
-                                Label(model.connecting ? "正在连接阅读服务" : "尚未连接阅读服务", systemImage: "network")
-                                Text("首次连接后，今天的记录会自动出现在这里。").font(.callout)
-                                Button("检查连接资料") { model.connectImported() }.buttonStyle(.bordered)
-                            }.todayCard()
-                        }
-                        VStack(alignment: .leading, spacing: 10) {
-                            Text("今日概览").font(.title2.bold())
-                            if let overview = model.today?.overview, !overview.text.isEmpty {
-                                Text(overview.text).textSelection(.enabled)
-                            } else {
-                                Text(model.today?.overview.state == "pending" ? "已有内容正在整理，完整稿会先出现在下方。" : "暂时没有已整理的概览。已有录音可能仍在上传或处理中。")
-                                    .foregroundStyle(.secondary)
+            GeometryReader { viewport in
+                ScrollViewReader { proxy in
+                    ScrollView {
+                        LazyVStack(alignment: .leading, spacing: 0) {
+                            opening(width: viewport.size.width)
+                            recordStatus.padding(.top, 20)
+                            if let error = model.operationError { Label(error, systemImage: "info.circle").font(.footnote).foregroundStyle(ReadingPalette.quiet).padding(.vertical, 12) }
+                            if let status = model.deletionStatus { DeletionProgress(status: status) }
+                            if !model.connected { connectionNotice }
+                            HStack {
+                                Text(showAll ? "全部记录" : "继续回看").font(.system(.title2, design: .serif))
+                                Spacer()
+                                Menu {
+                                    Button("主线", systemImage: showAll ? "circle" : "checkmark.circle") { showAll = false }
+                                    Button("全部记录", systemImage: showAll ? "checkmark.circle" : "circle") { showAll = true }
+                                } label: { Text(showAll ? "全部记录" : "主线 / 全部记录").font(.caption).padding(.vertical, 14) }
+                                    .accessibilityLabel("阅读范围，当前" + (showAll ? "全部记录" : "主线"))
+                            }.padding(.top, 28)
+                            ForEach(Array(visibleCards.dropFirst())) { card in cardLink(card) }
+                            if !showAll && cards.contains(where: { !$0.isMainReading }) {
+                                Button("其他记录也已保留，查看全部") { showAll = true }.font(.subheadline).padding(.vertical, 20)
                             }
-                        }.todayCard()
-                        VStack(alignment: .leading, spacing: 8) {
-                            Label("身体背景", systemImage: "heart.text.clipboard").font(.headline)
-                            if let body = model.today?.body, !body.lines.isEmpty {
-                                ForEach(Array(body.lines.enumerated()), id: \.offset) { _, line in Text(line).font(.callout) }
-                                Text("生理信号估计 · 参考 \(body.sampleCount) 条样本")
-                                    .font(.footnote).foregroundStyle(.secondary)
-                            } else {
-                                Text(model.healthEnabled ? "尚无足够数据判断身体状态，缺少记录不代表正常或平静。" : "身体背景未启用，录音和全文仍可使用。")
-                                    .font(.callout).foregroundStyle(.secondary)
+                            if visibleCards.isEmpty {
+                                Text(cards.isEmpty ? "有内容整理好后，会在这里留下一条线索。" : "其他记录已保留，可以切换全部查看。")
+                                    .font(.callout).foregroundStyle(ReadingPalette.quiet).padding(.vertical, 20)
                             }
-                        }.todayCard()
-                        if let error = model.operationError { Label(error, systemImage: "info.circle").font(.callout) }
-                        if let status = model.deletionStatus { DeletionProgress(status: status) }
-                        Text("自然对话").font(.title2.bold())
-                        if let cards = model.today?.cards, !cards.isEmpty {
-                            ForEach(cards.filter { $0.id != model.deletionStatus?.cardId }) { card in
-                                NavigationLink { ConversationDetail(card: card) } label: { ConversationRow(card: card) }
-                                    .buttonStyle(.plain).id(card.id)
-                            }
-                        } else { Text("暂未取得可读对话；不会用空小时填满今天。") .foregroundStyle(.secondary) }
-                    }.padding(20)
-                }.background(Color(.systemGroupedBackground)).refreshable { await model.load(day: day) }
-                    .navigationTitle(Calendar.current.isDateInToday(selectedDate) ? "今天" : selectedDate.formatted(date: .abbreviated, time: .omitted))
-                    .toolbar { ToolbarItem(placement: .topBarTrailing) {
-                        Button { settings = true } label: { Image(systemName: "gearshape") }.accessibilityLabel("设置")
-                    } }
+                        }.padding(.horizontal, 24).padding(.bottom, 36)
+                    }
+                    .coordinateSpace(name: "readingFlowScroll")
+                    .onPreferenceChange(FlowFrameKey.self) { frame in
+                        guard frame.width > 0, frame.height > 0 else { return }
+                        flowVisible = frame.maxY > 0 && frame.minY < viewport.size.height
+                    }
+                    .background(ReadingPalette.paper).refreshable { await model.load(day: day) }
+                    .toolbar(.hidden, for: .navigationBar)
                     .sheet(isPresented: $settings) { TodaySettings() }
+                    .sheet(isPresented: $dates) {
+                        NavigationStack {
+                            DatePicker("查看日期", selection: $selectedDate, displayedComponents: .date).datePickerStyle(.graphical).padding()
+                                .navigationTitle("选择日期")
+                                .toolbar { ToolbarItem(placement: .confirmationAction) { Button("完成") { dates = false } } }
+                        }.presentationDetents([.medium, .large])
+                    }
                     .sheet(isPresented: $hours) {
                         HourIndex(coverage: model.today?.coverage ?? [], selectedDate: selectedDate) { date in
                             hours = false
-                            if let card = model.today?.cards.first(where: { (PhoneV3Policy.date($0.endAt) ?? .distantPast) >= date }) {
-                                withAnimation { proxy.scrollTo(card.id, anchor: .top) }
+                            let target = model.today?.card(atOrAfter: date, excluding: model.deletionStatus?.cardId)
+                            if let target {
+                                if !target.isMainReading { showAll = true }
+                                Task { @MainActor in
+                                    await Task.yield()
+                                    if motionLimited { proxy.scrollTo(target.id, anchor: .top) }
+                                    else { withAnimation(.easeInOut(duration: 0.25)) { proxy.scrollTo(target.id, anchor: .top) } }
+                                }
                             }
                         }
                     }
-                    .task(id: day + (model.connected ? ":connected" : ":waiting")) { if model.connected { await model.load(day: day) } }
+                    .onReceive(NotificationCenter.default.publisher(for: ProcessInfo.thermalStateDidChangeNotification)) { _ in systemMotionLimited = ReadingMotionBudget.systemLimited }
+                    .task(id: day + (model.connected ? ":connected" : ":waiting") + String(describing: scenePhase)) {
+                        guard model.connected, scenePhase == .active else { return }; await model.load(day: day)
+                    }
+                }
+            }
+        }.tint(ReadingPalette.cobalt).preferredColorScheme(.light)
+    }
+    private func opening(width: CGFloat) -> some View {
+        let heroHeight = max(430, min(600, width * 1.54))
+        return VStack(alignment: .leading, spacing: 0) {
+            VStack(alignment: .leading, spacing: 0) {
+                HStack {
+                    Text("小鹿录音").font(.system(size: 18, weight: .regular, design: .serif)).tracking(4)
+                    Spacer()
+                    Button { settings = true } label: { Image(systemName: "gearshape").font(.title3).frame(width: 44, height: 44).background(ReadingPalette.paper.opacity(0.96), in: Circle()) }
+                        .accessibilityLabel("设置")
+                }.padding(.top, 22)
+                Text(ingestionHeadline).font(.caption2).foregroundStyle(ReadingPalette.quiet)
+                    .fixedSize(horizontal: false, vertical: true).padding(.top, 4)
+                Button { dates = true } label: {
+                    HStack(alignment: .center, spacing: 16) {
+                        Text(String(Calendar.current.component(.day, from: selectedDate))).font(.system(size: typeSize.isAccessibilitySize ? 90 : 116, weight: .regular, design: .serif)).fixedSize(horizontal: true, vertical: true).padding(.trailing, 8)
+                        VStack(alignment: .leading, spacing: 12) {
+                            Text(selectedDate.formatted(.dateTime.month().locale(Locale(identifier: "zh_CN"))).replacingOccurrences(of: " ", with: ""))
+                            Text("／").font(.system(size: 20, weight: .ultraLight)).foregroundStyle(ReadingPalette.quiet)
+                            Text(weekday)
+                        }.font(.system(.title3, design: .serif))
+                    }.foregroundStyle(ReadingPalette.ink)
+                }.buttonStyle(.plain).padding(.top, 32)
+                    .accessibilityLabel("选择日期，" + selectedDate.formatted(date: .complete, time: .omitted))
+                Spacer(minLength: 0)
+            }.frame(height: heroHeight, alignment: .top)
+                .background { GeometryReader { geometry in Color.clear.preference(key: FlowFrameKey.self, value: geometry.frame(in: .named("readingFlowScroll"))) } }
+            overview
+            if let card = featured {
+                NavigationLink { ConversationDetail(card: card).flowDestination(card.id, in: flow, motionDisabled: motionLimited) } label: {
+                    VStack(alignment: .leading, spacing: 12) {
+                        Text(card.title).font(.system(.subheadline, design: .serif)).foregroundStyle(ReadingPalette.ink).fixedSize(horizontal: false, vertical: true)
+                        HStack(spacing: 10) { Text("查看完整稿"); Image(systemName: "arrow.right") }.font(.subheadline).foregroundStyle(ReadingPalette.cobalt)
+                    }.padding(.top, 28).padding(.bottom, 24).frame(maxWidth: .infinity, alignment: .leading)
+                }.buttonStyle(.plain).id(card.id).flowSource(card.id, in: flow, motionDisabled: motionLimited)
+            }
+            bodyContext.padding(.top, 8)
+        }
+        .background(alignment: .top) {
+            EditorialPointFlow(animate: !motionLimited && flowVisible, renderAllowed: scenePhase == .active && flowVisible)
+                .frame(width: width, height: 844)
+                // Preserve the selected composition but keep all reading text clear.
+                .overlay(alignment: .top) {
+                    LinearGradient(stops: [
+                        .init(color: .clear, location: 0),
+                        .init(color: .clear, location: (heroHeight - 20) / 844),
+                        .init(color: ReadingPalette.paper, location: min(1, (heroHeight + 220) / 844))
+                    ], startPoint: .top, endPoint: .bottom)
+                }
+                .allowsHitTesting(false).accessibilityHidden(true)
+        }
+    }
+    private var weekday: String {
+        let formatter = DateFormatter(); formatter.locale = Locale(identifier: "zh_CN"); formatter.dateFormat = "EEE"; return formatter.string(from: selectedDate)
+    }
+    private var overview: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            HStack(spacing: 16) {
+                Text("今日概览").font(.system(.subheadline, design: .serif)).tracking(3)
+                Rectangle().fill(ReadingPalette.quiet.opacity(0.45)).frame(width: 120, height: 0.5)
+            }.foregroundStyle(ReadingPalette.ink)
+            if let value = model.today?.overview, !value.text.isEmpty {
+                Text(value.text).font(.system(.title2, design: .serif)).foregroundStyle(ReadingPalette.ink).lineSpacing(7).textSelection(.enabled)
+                if let start = value.coverageStartAt, let end = value.coverageEndAt {
+                    Text("内容覆盖 " + clock(start) + "–" + clock(end) + (value.isPartial == true ? " · 部分完成" : ""))
+                        .font(.caption).foregroundStyle(ReadingPalette.quiet)
+                } else if value.isPartial == true { Text("已整理部分，后续内容会继续更新").font(.caption).foregroundStyle(ReadingPalette.quiet) }
+            } else {
+                Text("正在整理这一天的记录。").font(.system(.title2, design: .serif)).foregroundStyle(ReadingPalette.quiet)
+                Text("已完成的片段可以先阅读全文。").font(.caption).foregroundStyle(ReadingPalette.quiet)
             }
         }
     }
-}
-
-private struct CoverageStrip: View {
-    let coverage: [PhoneToday.Coverage]; let day: Date
-    var body: some View {
-        VStack(spacing: 4) {
-            HStack(spacing: 3) {
-                ForEach(0..<24) { hour in
-                    let state = hourState(coverage, hour: hour, date: day)
-                    RoundedRectangle(cornerRadius: 2).fill(state == "recorded" ? Color.blue : state == "no_speech" ? .gray : .secondary.opacity(0.2))
-                        .frame(height: 10).overlay { if state == "pending" { Image(systemName: "ellipsis").font(.system(size: 7)).foregroundStyle(.primary) } }
+    private var bodyContext: some View {
+        DisclosureGroup(isExpanded: $bodyExpanded) {
+            VStack(alignment: .leading, spacing: 12) {
+                if let value = model.today?.body {
+                    ForEach(Array(value.lines.enumerated()), id: \.offset) { _, line in Text(line).font(.callout).lineSpacing(4) }
+                    Text("参考 \(value.sampleCount) 条样本 · 生理信号估计").font(.caption)
                 }
-            }.accessibilityHidden(true)
-            HStack { Text("00"); Spacer(); Text("06"); Spacer(); Text("12"); Spacer(); Text("18"); Spacer(); Text("24") }
-                .font(.caption).foregroundStyle(.secondary).accessibilityHidden(true)
-        }.padding(.vertical, 8)
+                Text("背景仅作参考，不说明某段对话造成了身体变化。").font(.caption)
+            }.foregroundStyle(ReadingPalette.quiet).padding(.top, 16)
+        } label: {
+            VStack(alignment: .leading, spacing: 5) {
+                Text("身体背景 · " + (model.today?.body.measuredThroughAt.map { "测量截至" + clock($0) } ?? "测量时间待同步"))
+                    .font(.caption).foregroundStyle(ReadingPalette.quiet)
+                if model.today?.body.state == "unknown" { Text("数据不足，暂不判断").font(.caption).foregroundStyle(ReadingPalette.quiet) }
+            }
+        }.tint(ReadingPalette.quiet)
+    }
+    private var ingestionHeadline: String {
+        guard let ingestion = model.today?.ingestion else { return "录音状态待同步" }
+        guard let latest = ingestion.latestRecordedAt else {
+            return ingestion.state == "empty" ? "当天尚未收到录音" : "录音状态待同步"
+        }
+        let recorded = "最新录到 " + clock(latest)
+        if ingestion.queuedTextCount > 0 { return recorded + " · 还有 \(ingestion.queuedTextCount) 段待整理" }
+        if ingestion.queuedAsrCount > 0 { return recorded + " · 还有 \(ingestion.queuedAsrCount) 段待转写" }
+        return recorded
+    }
+    private var recordStatus: some View {
+        Button { hours = true } label: {
+            HStack(alignment: .top, spacing: 8) {
+                Image(systemName: "waveform").padding(.top, 2)
+                VStack(alignment: .leading, spacing: 5) {
+                    if let ingestion = model.today?.ingestion {
+                        Text(ingestion.latestRecordedAt.map { "最新录到 " + clock($0) }
+                             ?? (ingestion.state == "empty" ? "当天尚未收到录音" : "录音状态待同步"))
+                        Text("转写至 " + (ingestion.latestTranscribedAt.map(clock) ?? "待同步")
+                             + " · 整理至 " + (ingestion.latestOrganizedAt.map(clock) ?? "待同步"))
+                        if ingestion.queuedAsrCount > 0 || ingestion.queuedTextCount > 0 {
+                            Text("\(ingestion.queuedAsrCount) 段待转写 · \(ingestion.queuedTextCount) 段待整理")
+                        }
+                        if ingestion.state == "budget_wait" { Text("等待文字整理额度，已收到的录音仍保留") }
+                    } else { Text("录音状态待同步") }
+                    Text(model.readStatus).foregroundStyle(ReadingPalette.quiet)
+                }.fixedSize(horizontal: false, vertical: true)
+                Spacer(); Image(systemName: "chevron.right").padding(.top, 2)
+            }.font(.caption).foregroundStyle(ReadingPalette.quiet).frame(minHeight: 44)
+        }.buttonStyle(.plain).accessibilityLabel("录音覆盖与处理进度")
+    }
+    private var connectionNotice: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text(model.connecting ? "正在连接" : "连接你的记录").font(.headline)
+            Button("检查连接") { model.connectImported() }.buttonStyle(.bordered)
+        }.readingSurface()
+    }
+    private func cardLink(_ card: PhoneToday.Card) -> some View {
+        NavigationLink { ConversationDetail(card: card).flowDestination(card.id, in: flow, motionDisabled: motionLimited) } label: {
+            ConversationRow(card: card, isLast: card.id == visibleCards.last?.id)
+        }.buttonStyle(.plain).id(card.id).flowSource(card.id, in: flow, motionDisabled: motionLimited)
     }
 }
+private func clock(_ value: String) -> String { PhoneV3Policy.date(value)?.formatted(date: .omitted, time: .shortened) ?? "待确认" }
+
 private func hourState(_ rows: [PhoneToday.Coverage], hour: Int, date: Date) -> String {
     let start = Calendar.current.date(bySettingHour: hour, minute: 0, second: 0, of: date) ?? date
     let end = start.addingTimeInterval(3600)
@@ -129,13 +261,25 @@ private func timeRange(_ card: PhoneToday.Card) -> String {
 }
 private struct ConversationRow: View {
     let card: PhoneToday.Card
+    let isLast: Bool
+    @Environment(\.dynamicTypeSize) private var typeSize
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
-            Text(timeRange(card)).font(.caption).foregroundStyle(.secondary)
-            Text(card.title).font(.headline)
-            Text(card.summary.isEmpty ? "摘要整理中，点击可读已有全文。" : card.summary).font(.body).lineLimit(3)
-            Label(ownerText(card.ownerLabel), systemImage: "person.wave.2").font(.caption).foregroundStyle(.secondary)
-        }.frame(maxWidth: .infinity, alignment: .leading).todayCard().accessibilityElement(children: .combine)
+            Text(clock(card.startAt) + " – " + clock(card.endAt)).font(.caption).foregroundStyle(ReadingPalette.quiet)
+            HStack(alignment: .top, spacing: 12) {
+                Text(card.title).font(.system(.title3, design: .serif)).foregroundStyle(ReadingPalette.ink)
+                    .fixedSize(horizontal: false, vertical: true)
+                Spacer(minLength: 4); Image(systemName: "arrow.up.right").font(.subheadline).foregroundStyle(ReadingPalette.cobalt)
+            }
+            if !card.summary.isEmpty {
+                Text(card.summary).font(.subheadline).foregroundStyle(ReadingPalette.quiet).lineSpacing(4)
+                    .lineLimit(typeSize.isAccessibilitySize ? nil : 3)
+            } else {
+                Text(card.summaryState == "background" ? "完整记录已保留" : card.summaryState == "failed" ? "摘要暂未完成 · 全文可读" : "摘要整理中 · 全文可读")
+                    .font(.caption).foregroundStyle(ReadingPalette.quiet)
+            }
+            if !isLast { Divider().padding(.top, 14) }
+        }.padding(.vertical, 14).accessibilityElement(children: .combine)
     }
 }
 private struct ConversationDetail: View {
@@ -143,6 +287,7 @@ private struct ConversationDetail: View {
     @Environment(\.dismiss) private var dismiss
     let card: PhoneToday.Card
     @State private var level = "摘要"
+    @Environment(\.dynamicTypeSize) private var typeSize
     @State private var plan: PhoneDeletionPlan?
     @State private var preparing = false
     @State private var error: String?
@@ -151,11 +296,17 @@ private struct ConversationDetail: View {
             VStack(alignment: .leading, spacing: 18) {
                 Text(timeRange(card)).font(.callout).foregroundStyle(.secondary)
                 Text(ownerText(card.ownerLabel)).font(.callout)
-                Picker("阅读版本", selection: $level) { ForEach(["摘要", "口语清稿", "七删一改整理稿"], id: \.self) { Text($0) } }.pickerStyle(.menu)
+                if typeSize.isAccessibilitySize {
+                    Picker("阅读版本", selection: $level) { ForEach(["摘要", "口语清稿", "七删一改整理稿"], id: \.self) { Text($0) } }.pickerStyle(.menu)
+                } else {
+                    Picker("阅读版本", selection: $level) {
+                        Text("摘要").tag("摘要"); Text("口语清稿").tag("口语清稿"); Text("整理稿").tag("七删一改整理稿")
+                    }.pickerStyle(.segmented)
+                }
                 let text = level == "摘要" ? (card.summary.isEmpty ? "摘要暂未完成，仍可切换阅读完整稿。" : card.summary) : level == "口语清稿" ? card.clean : card.distilled
                 ForEach(Array(text.components(separatedBy: "\n\n").enumerated()), id: \.offset) { _, paragraph in
                     if paragraph.hasPrefix("## ") { Text(String(paragraph.dropFirst(3))).font(.title3.bold()) }
-                    else { Text(.init(paragraph)).textSelection(.enabled) }
+                    else { Text(.init(paragraph)).lineSpacing(5).textSelection(.enabled) }
                 }
                 if let error { Text(error).foregroundStyle(.secondary) }
                 Button(role: .destructive) {

@@ -5,13 +5,46 @@ public struct PhoneToday: Codable, Sendable {
     public let generatedAt: String; public let revision: Int
     public let overview: Overview; public let body: BodyContext
     public let coverage: [Coverage]; public let cards: [Card]
-    public struct Overview: Codable, Sendable { public let state: String; public let text: String }
-    public struct BodyContext: Codable, Sendable { public let state: String; public let lines: [String]; public let sampleCount: Int }
+    public let ingestion: Ingestion?
+    public struct Ingestion: Codable, Sendable {
+        public let latestRecordedAt: String?; public let latestTranscribedAt: String?; public let latestOrganizedAt: String?
+        public let receivedCount: Int; public let transcribedCount: Int
+        public let queuedTextCount: Int; public let queuedAsrCount: Int
+        public let state: String
+    }
+    public struct Overview: Codable, Sendable {
+        public let state: String; public let text: String
+        public let coverageStartAt: String?; public let coverageEndAt: String?; public let updatedAt: String?
+        public let isPartial: Bool?; public let coveredCardCount: Int?; public let pendingCardCount: Int?
+    }
+    public struct BodyContext: Codable, Sendable {
+        public let state: String; public let lines: [String]; public let sampleCount: Int
+        public let measuredThroughAt: String?
+    }
     public struct Coverage: Codable, Sendable { public let startAt: String; public let endAt: String; public let state: String }
     public struct Card: Codable, Identifiable, Sendable {
         public let id: String; public let version: Int; public let title: String; public let summary: String
         public let startAt: String; public let endAt: String; public let ownerLabel: String
         public let clean: String; public let distilled: String
+        public let readingRole: String?; public let summaryState: String?
+        public var isMainReading: Bool { readingRole != "background" }
+
+    }
+    /// Reading order follows the recording event, never the model update time.
+    public var cardsNewestFirst: [Card] {
+        let dated: [(card: Card, end: Date)] = cards.map { ($0, PhoneV3Policy.date($0.endAt) ?? Date.distantPast) }
+        let ordered = dated.sorted { left, right in
+            if left.end == right.end { return left.card.id < right.card.id }
+            return left.end > right.end
+        }
+        return ordered.map { $0.card }
+    }
+    public func card(atOrAfter date: Date, excluding excludedID: String? = nil) -> Card? {
+        let eligible = cards.compactMap { card -> (Card, Date)? in
+            guard card.id != excludedID, let end = PhoneV3Policy.date(card.endAt), end >= date else { return nil }
+            return (card, end)
+        }
+        return eligible.min { $0.1 == $1.1 ? $0.0.id < $1.0.id : $0.1 < $1.1 }?.0
     }
     public static func decode(_ data: Data, requestedDay: String) throws -> Self {
         guard data.count <= 2 * 1024 * 1024 else { throw StoreError.invalidMetadata }
@@ -23,6 +56,20 @@ public struct PhoneToday: Codable, Sendable {
               ["unknown", "within_observed_range", "deviation", "disabled"].contains(v.body.state),
               v.body.sampleCount >= 0, v.body.lines.count <= 64, v.coverage.count <= 2048, v.cards.count <= 512,
               Set(v.cards.map(\.id)).count == v.cards.count else { throw StoreError.invalidMetadata }
+        let dates = [v.overview.coverageStartAt, v.overview.coverageEndAt, v.overview.updatedAt, v.body.measuredThroughAt].compactMap { $0 }
+        guard dates.allSatisfy({ PhoneV3Policy.date($0) != nil }),
+              v.overview.coveredCardCount.map({ $0 >= 0 }) ?? true,
+              v.overview.pendingCardCount.map({ $0 >= 0 }) ?? true else { throw StoreError.invalidMetadata }
+        if let a = v.overview.coverageStartAt, let b = v.overview.coverageEndAt {
+            guard PhoneV3Policy.date(a)! <= PhoneV3Policy.date(b)! else { throw StoreError.invalidMetadata }
+        }
+        if let ingestion = v.ingestion {
+            let stageDates = [ingestion.latestRecordedAt, ingestion.latestTranscribedAt, ingestion.latestOrganizedAt].compactMap { $0 }
+            guard stageDates.allSatisfy({ PhoneV3Policy.date($0) != nil }),
+                  ingestion.receivedCount >= 0, ingestion.transcribedCount >= 0,
+                  ingestion.queuedTextCount >= 0, ingestion.queuedAsrCount >= 0,
+                  ["budget_wait", "processing", "up_to_date", "empty"].contains(ingestion.state) else { throw StoreError.invalidMetadata }
+        }
         for c in v.coverage {
             guard let a = PhoneV3Policy.date(c.startAt), let b = PhoneV3Policy.date(c.endAt), b >= a,
                   ["recorded", "no_speech", "pending", "unknown"].contains(c.state) else { throw StoreError.invalidMetadata }
@@ -30,7 +77,9 @@ public struct PhoneToday: Codable, Sendable {
         for c in v.cards {
             guard cardID(c.id), c.version > 0, c.title.count <= 256, c.summary.count <= 4000,
                   let a = PhoneV3Policy.date(c.startAt), let b = PhoneV3Policy.date(c.endAt), b >= a,
-                  ["self", "other", "unknown"].contains(c.ownerLabel) else { throw StoreError.invalidMetadata }
+                  ["self", "other", "unknown"].contains(c.ownerLabel),
+                  c.readingRole.map({ ["main", "background", "unknown"].contains($0) }) ?? true,
+                  c.summaryState.map({ ["ready", "pending", "background", "failed"].contains($0) }) ?? true else { throw StoreError.invalidMetadata }
         }
         return v
     }

@@ -118,7 +118,7 @@ class Worker:
                 if filtered != batch:
                     self.state.put(key, filtered)
         # Invalidate summaries that might contain retired content; never send them as future context.
-        for key, value in self.state.items('overview:'):
+        for key, value in self.state.items('overview:')+self.state.items('day-reading:')+self.state.items('manual-day-ready:'):
             if 'input_group_ids' not in value or any(group_id in value['input_group_ids'] for group_id in snap['group_ids']):
                 self.state.put(key, {'retired': True, 'attempts': 3})
         local_failures = []; cloud_failures = []
@@ -221,27 +221,43 @@ class Worker:
             current['retry_after'] = dt.datetime.combine(tomorrow, dt.time(), dt.timezone.utc).timestamp()+60
         self.state.put(key, current)
 
-    def tick(self, clock=None):
+    def tick(self, clock=None, reviewed_scope=None):
         now = time.time() if clock is None else clock
         since = self.capture_floor
-        self.reconcile_deletions()
+        if reviewed_scope is None:
+            self.reconcile_deletions()
         generation = retirement.snapshot(self.config)['generation']
+        if reviewed_scope is not None:
+            if generation != reviewed_scope['expected_generation']:
+                raise RuntimeError('reviewed_batch_generation_changed')
+            generation = reviewed_scope['expected_generation']
         groups = discover(self.config['asr_outbox'], self.config['receiver_sessions'], capture_since=since,
                           derived_asr_root=self.config.get('derived_asr_outbox'), derived_asr_model=self.config.get('derived_asr_model'),
                           retired_source_ids=retirement.snapshot(self.config).get('retired_raw_source_ids', []))
-        self.manifest()  # Even with no new audio, retire stale manifest entries without deleting files.
-        # First finish generated but unpublished artifacts. Never call the provider again.
-        # Local artifacts are independently recoverable even after cloud published=True.
-        for date in sorted({b['date'] for _, b in self.state.items('batch:') if b.get('output') and self._eligible(b)}):
-            try:
-                self.export(date)
-            except Exception as error:
-                self.state.put('sink-local:'+date, {'reason': type(error).__name__})
-        for _, batch in self.state.items('batch:'):
-            if batch.get('output') and self._eligible(batch) and (not batch.get('published') or not self.publisher):
-                self._publish(batch)
+        if reviewed_scope is None:
+            self.manifest()  # Even with no new audio, retire stale manifest entries without deleting files.
+            # First finish generated but unpublished artifacts. Never call the provider again.
+            # Local artifacts are independently recoverable even after cloud published=True.
+            for date in sorted({b['date'] for _, b in self.state.items('batch:') if b.get('output') and self._eligible(b)}):
+                try:
+                    self.export(date)
+                except Exception as error:
+                    self.state.put('sink-local:'+date, {'reason': type(error).__name__})
+            for _, batch in self.state.items('batch:'):
+                if batch.get('output') and self._eligible(batch) and (not batch.get('published') or not self.publisher):
+                    self._publish(batch)
         completed = 0; speaker_waiting = 0; unknown_units = 0; speaker_reasons = {}
         for (date, session), slots in sorted(groups.items()):
+            fixed_rows = None
+            if reviewed_scope is not None:
+                target = self.state.get('batch:' + reviewed_scope['batch_id'])
+                if target is None or (date, session) != (target['date'], target['session']):
+                    continue
+                fixed_rows = [slots.get(seq) for seq in target['sequences']]
+                if (any(row is None for row in fixed_rows) or
+                    [row.source_id for row in fixed_rows] != reviewed_scope['source_ids'] or
+                    digest({'source_batch': batch_identity(fixed_rows), 'schema': GROUP_SCHEMA}) != reviewed_scope['batch_id']):
+                    raise ValueError('reviewed_batch_scope_changed')
             cursor_key = 'consumed:' + date + ':' + session
             consumed = set(self.state.get(cursor_key, [])) if since is None else set()
             consumed.update(seq for seq, item in slots.items() if item is not None and item.asr_model == 'source_retired')
@@ -254,11 +270,14 @@ class Worker:
                     consumed.update(prior['sequences'])
             if since is not None:
                 consumed.update(seq for seq, item in slots.items() if item is not None and item.captured < since)
-            self.state.put(cursor_key, sorted(consumed))
+            if reviewed_scope is None:
+                self.state.put(cursor_key, sorted(consumed))
             window_args = {'max_seconds': int(self.config.get('batch_seconds', 300)),
                            'max_chars': int(self.config.get('batch_chars', 3500)),
                            'tail_seconds': int(self.config.get('tail_seconds', 180)), 'floor': floor}
-            if self.conversation_mode:
+            if fixed_rows is not None:
+                rows = fixed_rows
+            elif self.conversation_mode:
                 rows = choose_window(slots, consumed, now, pause_seconds=self.config.get('conversation_pause_seconds', 12), **window_args)
             else:
                 rows = next_batch(slots, consumed, now, **window_args)
@@ -271,7 +290,12 @@ class Worker:
             batch = self.state.get(key, {'id': identity, 'date': date, 'session': session,
                     'sequence': rows[0].sequence, 'sequences': [r.sequence for r in rows], 'captured': rows[0].captured,
                     'sources': [r.identity() for r in rows], 'attempts': 0})
-            if batch.get('attempts', 0) >= 3 or batch.get('retry_after', 0) > now:
+            waiting_budget = batch.get('last_error') == 'daily_text_token_budget_reached'
+            budget_available = False
+            if waiting_budget:
+                budget = self.state.budget(dt.datetime.now(dt.timezone.utc).date().isoformat())
+                budget_available = budget['committed_tokens'] < int(self.config.get('provider',{}).get('daily_token_reservation_limit',0))
+            if batch.get('attempts', 0) >= 3 or (batch.get('retry_after', 0) > now and not (waiting_budget and budget_available)):
                 continue
             if not any(r.text for r in rows):
                 with retirement.guard(self.config, generation):

@@ -9,8 +9,9 @@ import time
 from zoneinfo import ZoneInfo
 
 from context_analysis import retirement
+from context_analysis.ingestion import progress
 from context_analysis.health import analyze, locations
-from context_analysis.reading import cards, iso, Summaries
+from context_analysis.reading import cards, iso, Summaries, incremental_overview
 from text_output.store import atomic, singleton
 from text_worker import Worker
 
@@ -36,6 +37,7 @@ class Overview:
             day_cards = cards(self.worker._saved_batches(date), snap['group_ids'])
             for card in day_cards:
                 digest = card.pop('version')
+                card['_content_version']=digest
                 version_key = 'card-version:' + card['id']
                 old = self.state.get(version_key, {})
                 revision = old.get('revision', 0) + (old.get('digest') != digest)
@@ -43,19 +45,19 @@ class Overview:
                 card['version'] = revision
                 # Hash identity used for summary cache; public card version stays numeric.
                 summary_card = dict(card, version=digest)
-                summary = self.summary.get([summary_card], 'card:' + card['id'], now, allow_request=self.summary.requests < 2)
-                if summary['state'] == 'ready':
-                    card['summary'] = summary['text']
+                embedded=' '.join(card['embedded_summaries'])
+                if card['reading_role']=='background':
+                    card['summary']='';card['summary_state']='background'
+                elif card['editorial_complete'] and embedded and len(embedded)<=220:
+                    card['summary']=embedded;card['summary_state']='ready'
                 else:
-                    card['summary'] = ''
-            daily_inputs = [dict(card, clean=card['summary']) for card in day_cards]
-            day_ready = all(card['summary'] for card in day_cards)
-            overview = self.summary.get(daily_inputs, 'day:' + date, now, allow_request=day_ready and self.summary.requests < 2)
-            if overview['state'] == 'empty':
-                overview['state'] = 'no_data'
+                    summary = self.summary.get([summary_card], 'card:' + card['id'], now, allow_request=self.summary.requests < 1)
+                    card['summary'] = summary['text'] if summary['state']=='ready' else ''
+                    card['summary_state'] = summary['state']
+            overview = incremental_overview(self.state,self.summary,day_cards,date,now,self.config,snap['generation'])
             flags = context.get('function_flags', {})
             body = analyze(context.get('health', []), date, timezone, now) if flags.get('health_enabled') else {
-                'state': 'disabled', 'lines': ['健康背景尚未启用。'], 'sample_count': 0}
+                'state': 'disabled', 'lines': ['健康背景尚未启用。'], 'sample_count': 0, 'measured_through_at': None}
             local_day = dt.datetime.combine(dt.date.fromisoformat(date), dt.time(), ZoneInfo(timezone))
             visits = locations(context.get('places', []), local_day.timestamp(), (local_day+dt.timedelta(days=1)).timestamp(), now) if flags.get('location_enabled') else []
             if visits:
@@ -71,11 +73,15 @@ class Overview:
                     if source.get('captured') is not None and source.get('duration') is not None:
                         coverage.append({'start_at': iso(source['captured']), 'end_at': iso(source['captured']+source['duration']), 'state': 'no_speech' if batch.get('no_speech') else 'recorded' if batch.get('output') else 'pending'})
             public = {'version': 3, 'retirement_generation': snap['generation'], 'date': date, 'timezone': timezone, 'generated_at': iso(now),
-                'overview': {k: overview[k] for k in ('state','text')},
-                'body': {k: body[k] for k in ('state','lines','sample_count')}, 'coverage': coverage, 'cards': []}
+                'overview': overview,
+                'body': {k: body[k] for k in ('state','lines','sample_count','measured_through_at')}, 'coverage': coverage, 'cards': []}
+            if self.config.get('asr_outbox') and self.config.get('receiver_sessions'):
+                public['ingestion']=progress(self.config,self.state,date,self.worker.capture_floor,snap.get('retired_raw_source_ids',[]))
             sidecar = {'version': 1, 'cards': []}
             for card in day_cards:
                 spans = card.pop('source_spans'); card.pop('source_ids', None)
+                for private_field in ('summary_input','embedded_summaries','editorial_complete','_content_version'):
+                    card.pop(private_field, None)
                 card['owner_label'] = 'self' if card['owner_label']=='疑似本人讲话' else 'other' if card['owner_label']=='包含未匹配本人的声音' else 'unknown'
                 public['cards'].append(card)
                 sidecar['cards'].append({'id': card['id'], 'version': card['version'], 'group_id': card['id'],
@@ -92,7 +98,7 @@ class Overview:
                 self.state.put('reading-revision:'+date, revision)
         if ledger:
             with retirement.guard(self.config, snap['generation']):
-                for key, value in self.state.items('overview:'):
+                for key, value in self.state.items('overview:')+self.state.items('day-reading:')+self.state.items('manual-day-ready:'):
                     if 'input_group_ids' not in value or set(value['input_group_ids']) & set(snap['group_ids']):
                         if not value.get('retired'):
                             self.state.put(key, {'retired': True, 'attempts': 3})

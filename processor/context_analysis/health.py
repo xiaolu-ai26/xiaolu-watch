@@ -160,7 +160,7 @@ def analyze(samples, date, timezone, now):
     workout_minutes = interval_minutes(workouts, start, min(finish,now))
     if workout_minutes > 0:
         lines.append(f'当天已有运动区间合计 {workout_minutes:.0f} 分钟。')
-    return {'state': state, 'reason': reason, 'lines': lines, 'sample_count': len(today),
+    return {'state': state, 'measured_through_at': dt.datetime.fromtimestamp(max(r['end'] for r in today), dt.timezone.utc).isoformat().replace('+00:00','Z') if today else None, 'reason': reason, 'lines': lines, 'sample_count': len(today),
             'coverage': {'heart_rate': len(current['heart_rate']), 'hrv_sdnn': len(current['hrv_sdnn']),
                          'baseline_days': days, 'invalid_samples': invalid},
             'comparison': comparisons, 'measurement_contexts': {k: {'metric': v[0], 'setting': v[1]} for k,v in criteria.items()}, 'method': 'experimental_resting_daily_median_v1',

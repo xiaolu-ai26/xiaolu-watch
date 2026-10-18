@@ -55,7 +55,7 @@ class GroupChecks(unittest.TestCase):
     def test_local_identity_caption_and_cross_window_append_only(self):
         units=utterances([row()]);units[0]['owner']='self';units[1]['owner']='other'
         first,meta=materialize({'groups':[group('散步安排',[0,1])],'uncertain_terms':[]},units,'batch1')
-        self.assertIn('未匹配本人',first['clean']);self.assertNotIn(row().source_id,first['clean'])
+        self.assertNotIn('未匹配本人',first['clean']);self.assertIn('未匹配本人',meta[0]['owner_caption']);self.assertNotIn(row().source_id,first['clean'])
         newer=utterances([row(1,'如果下雨就带伞。')]);next_value={'groups':[group('散步安排',[0],True,'如果下雨就带伞。')],'uncertain_terms':[]}
         output,next_meta=materialize(next_value,newer,'batch2',meta[-1]);self.assertEqual(meta[-1]['id'],next_meta[-1]['id'])
         self.assertIn('（续）',output['clean']);self.assertNotIn('明天散步',output['clean']);self.assertEqual(next_meta[0]['window_count'],2)
@@ -104,7 +104,7 @@ class SpeakerChecks(unittest.TestCase):
             units=utterances([r]);self.assertFalse(attach(units,[r],c,state,61)['waiting'])
             rendered,metadata=materialize({'groups':[group('散步安排',[0,1])],'uncertain_terms':[]},units,'prior')
             saved=copy.deepcopy((rendered,metadata));atomic(path,v);later=utterances([r]);attach(later,[r],c,state,62);self.assertEqual({u['owner'] for u in later},{'self'})
-            self.assertEqual((rendered,metadata),saved);self.assertIn('归属未确认',rendered['clean']);state.close()
+            self.assertEqual((rendered,metadata),saved);self.assertNotIn('归属未确认',rendered['clean']);self.assertEqual(metadata[0]['owner_caption'],'归属未确认');state.close()
 
     def test_malformed_sidecar_roots_fail_unknown_without_blocking_text(self):
         with tempfile.TemporaryDirectory() as td:
@@ -114,7 +114,7 @@ class SpeakerChecks(unittest.TestCase):
                 units=utterances([r]);result=attach(units,[r],c,state,100)
                 self.assertFalse(result['waiting']);self.assertEqual({u['owner'] for u in units},{'unknown'})
                 output,_=materialize({'groups':[group('散步安排',[0,1])],'uncertain_terms':[]},units,'safe')
-                self.assertIn('归属未确认',output['clean']);self.assertIn('散步',output['clean'])
+                self.assertNotIn('归属未确认',output['clean']);self.assertIn('散步',output['clean'])
             state.close()
 
 

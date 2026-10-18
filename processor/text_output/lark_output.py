@@ -201,6 +201,7 @@ class Lark:
             for block in owned:
                 if block not in entry:
                     entry.append(block)
+            day.setdefault('rendered_groups', {}).setdefault(kind, []).append({'id':group['id'],'rendered':group[kind+'_rendered']})
             offset += count
 
     def reconcile(self, date):
@@ -246,6 +247,9 @@ class Lark:
             end = next((i for i in range(section + 1, len(current)) if current[i]['tag'] == 'h1'), len(current))
             anchor = current[end - 1]['id']
             insertion = blocks(batch[kind])
+            if not insertion:
+                self.state.put(done_key, True)
+                continue
             target = shape(current[:end]) + expected(insertion) + shape(current[end:])
             day.update(expected=target, pending={'batch': batch['id'], 'kind': kind, 'done_key': done_key, 'base': shape(current), 'group_bindings': batch.get('_groups', []), 'insert_at': end, 'insert_count': len(insertion)})
             self.state.put(key, day)
@@ -272,6 +276,7 @@ class Lark:
         if day.get('pending'):
             day = self.reconcile(date)
         current = self.fetch(day['id'])
+        day = self._settle_rewrite(date,day,current)
         pending = day.get('delete_pending')
         if pending:
             if identities(current) == pending.get('after_identity'):
@@ -298,7 +303,13 @@ class Lark:
             if identity in actual_by_id and actual_by_id[identity] != original:
                 raise RuntimeError('deletion_owned_block_content_changed')
         remaining = [block for block in current if block.get('id') not in owned_by_id]
-        if shape(remaining) != target:
+        if day.get('group_projection_complete'):
+            mapped=[block['id'] for entry in mapping.values() for values in entry.values() for block in values]
+            body_ids=[block['id'] for block in current if block['tag'] not in ('title','h1')]
+            if len(mapped)!=len(set(mapped)) or not set(body_ids).issubset(set(mapped)) or not (set(mapped)-set(body_ids)).issubset(set(owned_by_id)):
+                raise RuntimeError('deletion_projection_ownership_incomplete')
+            target=shape(remaining)
+        elif shape(remaining) != target:
             raise RuntimeError('deletion_group_ownership_unavailable_or_changed')
         for index in reversed(range(len(current))):
             block = current[index]
@@ -320,4 +331,148 @@ class Lark:
             self.state.put(key, day)
         for group in deleted_group_ids:
             day.get('group_blocks', {}).pop(group, None)
+        for kind in ('clean','distilled'):
+            if kind in day.get('rendered_groups',{}):day['rendered_groups'][kind]=[entry for entry in day['rendered_groups'][kind] if entry['id'] not in deleted_group_ids]
+        if day.get('rewrite_revision'):
+            day.update(rewrite_revision=None,rewritten_kinds=[],last_rewrite_revision=None,revision_interrupted_by_retirement=True)
         self.state.put(key,day)
+
+    @staticmethod
+    def _revision_signature(xml):
+        tree=ET.fromstring('<root>'+xml+'</root>')
+        for element in tree.iter():
+            if element.tag not in ('root','title','h1','h2','p','br','b') or set(element.attrib)-{'id'}:
+                raise RuntimeError('day_revision_custom_format_preserved')
+        return [(e.tag,re.sub(r'\s+','',e.text or ''),re.sub(r'\s+','',e.tail or '')) for e in tree.iter()]
+
+    def _full_snapshot(self, document_id):
+        response=self.command(['+fetch','--doc',document_id,'--detail','full'])
+        raw=response['data']['document']['content']
+        return response,raw,document_blocks(raw)
+
+    @staticmethod
+    def _revision_groups(batches, kind):
+        result=[]
+        for batch in batches:
+            groups=batch.get('conversation_groups',[])
+            if all(kind+'_rendered' in group for group in groups) and groups:
+                result.extend(groups);continue
+            if not groups and not batch['output'][kind].strip():continue
+            pieces=batch['output'][kind].split('\n\n## ')
+            if len(pieces)!=len(groups):raise RuntimeError('legacy_group_projection_unavailable')
+            result.extend(dict(group,**{kind+'_rendered':('## ' if index else '')+pieces[index]}) for index,group in enumerate(groups))
+        return result
+
+    def _set_section_projection(self, day, groups, kind, current):
+        label='口语清稿' if kind=='clean' else '七删一改整理稿'
+        start=next(i for i,x in enumerate(current) if x['tag']=='h1' and x['text']==label)+1
+        end=next((i for i in range(start,len(current)) if current[i]['tag']=='h1'),len(current))
+        for entry in day.setdefault('group_blocks',{}).values():entry.pop(kind,None)
+        day.setdefault('rendered_groups',{})[kind]=[]
+        self._bind_groups(day,groups,kind,current[start:end])
+        expected_ids=[item['id'] for entry in day['group_blocks'].values() for values in entry.values() for item in values]
+        body_ids=[item['id'] for item in current if item['tag'] not in ('title','h1')]
+        day['group_projection_complete']=len(expected_ids)==len(set(expected_ids)) and set(expected_ids)==set(body_ids)
+
+    @staticmethod
+    def _rendered_day_items(date, day):
+        result=[('title',date+' 录音清稿与整理稿'),('h1','口语清稿')]
+        for entry in day.get('rendered_groups',{}).get('clean',[]):result+=blocks(entry['rendered'])
+        result+=[('h1','七删一改整理稿')]
+        for entry in day.get('rendered_groups',{}).get('distilled',[]):result+=blocks(entry['rendered'])
+        return result
+
+    def _settle_rewrite(self, date, day, current, raw=None):
+        pending=day.get('rewrite_pending')
+        if not pending:return day
+        if raw is None:
+            _,raw,latest=self._full_snapshot(day['id'])
+            if identities(latest)!=identities(current):raise RuntimeError('day_revision_changed_during_reconcile')
+        expected_day=dict(day,rendered_groups=dict(day.get('rendered_groups',{})))
+        expected_day['rendered_groups'][pending['kind']]=[{'id':g['id'],'rendered':g[pending['kind']+'_rendered']} for g in pending['replacement_groups']]
+        if self._revision_signature(raw)!=self._revision_signature(fragment(self._rendered_day_items(date,expected_day))):
+            raise RuntimeError('day_revision_custom_format_preserved')
+        kept={item[0] for item in pending['untouched_identity']}
+        if shape(current)!=pending['target_shape'] or identities([x for x in current if x.get('id') in kept])!=pending['untouched_identity']:
+            raise RuntimeError('day_revision_outcome_unknown_preserved')
+        self._set_section_projection(day,pending['replacement_groups'],pending['kind'],current)
+        day.update(snapshot=current,expected=shape(current),rewrite_pending=None)
+        day.setdefault('rewritten_kinds',[]).append(pending['kind'])
+        self.state.put('doc:'+date,day)
+        return day
+
+    def revise_managed_day(self, date, before_batches, after_batches, backup_directory, guard_factory=None):
+        """Journaled machine-owned section revision, independently retirement-safe."""
+        import contextlib
+        import hashlib
+        factory=guard_factory or contextlib.nullcontext
+        key='doc:'+date;day=self.state.get(key,{})
+        if not day.get('id') or day.get('pending') or day.get('delete_pending'):
+            raise RuntimeError('day_revision_requires_settled_managed_document')
+        def items(batches):
+            result=[('title',date+' 录音清稿与整理稿'),('h1','口语清稿')]
+            for batch in batches:result+=blocks(batch['output']['clean'])
+            result+=[('h1','七删一改整理稿')]
+            for batch in batches:result+=blocks(batch['output']['distilled'])
+            return result
+        target_items=items(after_batches)
+        revision=hashlib.sha256(fragment(target_items).encode()).hexdigest()
+        with factory():
+            response,raw,current=self._full_snapshot(day['id'])
+            day=self._settle_rewrite(date,day,current,raw)
+            if identities(current)!=identities(day.get('snapshot',[])):
+                raise RuntimeError('day_revision_human_identity_edit_preserved')
+            if day.get('last_rewrite_revision')==revision and shape(current)==expected(target_items):
+                if self._revision_signature(raw)!=self._revision_signature(fragment(target_items)):raise RuntimeError('day_revision_custom_format_preserved')
+                return  # Cloud committed before a local crash: exact completed outcome, no new call.
+            if day.get('rewrite_revision') not in (None,revision):raise RuntimeError('another_day_revision_in_progress')
+            original_items=self._rendered_day_items(date,day) if day.get('group_projection_complete') else items(before_batches)
+            if shape(current)!=expected(original_items) or self._revision_signature(raw)!=self._revision_signature(fragment(original_items)):
+                raise RuntimeError('day_revision_source_or_format_changed')
+            if not day.get('group_projection_complete'):
+                for kind in ('clean','distilled'):
+                    self._set_section_projection(day,self._revision_groups(before_batches,kind),kind,current)
+                if not day['group_projection_complete']:raise RuntimeError('day_revision_incomplete_ownership')
+            if not day.get('rewrite_revision'):
+                atomic(Path(backup_directory)/'before-cloud.json',response)
+                day.update(rewrite_revision=revision,rewritten_kinds=[]);self.state.put(key,day)
+        for kind,label in [('distilled','七删一改整理稿'),('clean','口语清稿')]:
+            if kind in day.get('rewritten_kinds',[]):continue
+            with factory():
+                # Reload durable state so deletion/another worker cannot be overwritten.
+                day=self.state.get(key)
+                if day.get('rewrite_revision')!=revision:raise RuntimeError('day_revision_interrupted')
+                _,raw,current=self._full_snapshot(day['id'])
+                if identities(current)!=identities(day['snapshot']):raise RuntimeError('day_revision_human_edit_preserved')
+                if self._revision_signature(raw)!=self._revision_signature(fragment(self._rendered_day_items(date,day))):
+                    raise RuntimeError('day_revision_custom_format_preserved')
+                start=next(i for i,x in enumerate(current) if x['tag']=='h1' and x['text']==label)+1
+                end=next((i for i in range(start,len(current)) if current[i]['tag']=='h1'),len(current))
+                replacement=[]
+                for batch in after_batches:replacement+=blocks(batch['output'][kind])
+                replacement_groups=self._revision_groups(after_batches,kind)
+                untouched=current[:start]+current[end:]
+                target=shape(current[:start])+expected(replacement)+shape(current[end:])
+                if shape(current[start:end])==expected(replacement):
+                    self._set_section_projection(day,replacement_groups,kind,current)
+                    day.setdefault('rewritten_kinds',[]).append(kind);self.state.put(key,day);continue
+                day['rewrite_pending']={'kind':kind,'target_shape':target,'untouched_identity':identities(untouched),'replacement_groups':replacement_groups}
+                self.state.put(key,day)
+                if replacement:
+                    path=self.home/'fragments'/('revision-'+revision+'-'+kind+'.xml');atomic(path,fragment(replacement))
+                    arguments=['+update','--doc',day['id'],'--command','block_replace' if end>start else 'block_insert_after']
+                    arguments+=['--start-block-id',current[start]['id'],'--end-block-id',current[end-1]['id']] if end>start else ['--block-id',current[start-1]['id']]
+                    arguments+=['--doc-format','xml','--content','@./'+path.relative_to(self.home).as_posix()]
+                else:arguments=['+update','--doc',day['id'],'--command','block_delete','--start-block-id',current[start]['id'],'--end-block-id',current[end-1]['id']]
+                changed=self.command(arguments);atomic(Path(backup_directory)/('cloud-'+kind+'-response.json'),changed)
+                _,verified_raw,verified=self._full_snapshot(day['id'])
+                if changed.get('data',{}).get('warnings'):raise RuntimeError('day_revision_readback_requires_review')
+                day=self._settle_rewrite(date,day,verified,verified_raw)  # Binding is durable BEFORE releasing this range guard.
+        with factory():
+            day=self.state.get(key);_,raw,current=self._full_snapshot(day['id'])
+            if self._revision_signature(raw)!=self._revision_signature(fragment(target_items)):
+                raise RuntimeError('day_revision_custom_format_preserved')
+            if identities(current)!=identities(day['snapshot']) or shape(current)!=expected(target_items) or not day.get('group_projection_complete'):
+                raise RuntimeError('day_revision_final_readback_mismatch')
+            day.update(last_rewrite_revision=revision,rewrite_revision=None,rewritten_kinds=[])
+            self.state.put(key,day)
