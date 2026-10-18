@@ -28,8 +28,7 @@ final class HealthContextCollector {
             ("steps", HKObjectType.quantityType(forIdentifier: .stepCount)!),
             ("sleep", HKObjectType.categoryType(forIdentifier: .sleepAnalysis)!),
             ("workout", HKObjectType.workoutType())]
-        // SDK availability is not evidence of S9 measurements. Probe type availability only.
-        if #available(iOS 27.0, *) { _ = HKObjectType.quantityType(forIdentifier: .heartRateVariabilityRMSSD) }
+        // Use established SDNN only. A version check does not guarantee that a new identifier exists on beta runtimes.
         return value
     }
     func requestEnable() {

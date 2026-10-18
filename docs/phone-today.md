@@ -31,7 +31,7 @@ Library/Application Support/WatchMemory/phone-onboarding.json
 
 ## 健康和地点：默认关闭，分别启用
 
-身体背景只读 HealthKit 中实际存在的心率、静息心率、HRV SDNN、睡眠、步数及运动记录，不写入样本，不创建 workout 来维持录音。首次启用可读取有限近期历史以准备比较，之后使用 observer 和 anchored 增量；SDK 27 中只探测 RMSSD 类型存在，不承诺 S9 有对应或连续采样。
+身体背景只读 HealthKit 中实际存在的心率、静息心率、HRV SDNN、睡眠、步数及运动记录，不写入样本，不创建 workout 来维持录音。首次启用可读取有限近期历史以准备比较，之后使用 observer 和 anchored 增量；当前使用已有的 SDNN，不调用新增的 RMSSD 类型标识符，也不承诺 S9 有连续 HRV 采样。SDK 的版本声明不能代替旧测试版运行时可用性验证。
 
 - 授权流程完成不等于每一种读取均获准。空结果可能是没有记录、尚未同步或权限不可用，不能直接断言读取被拒。
 - 运动背景只来自真实样本或明确的 heart-rate motion metadata。缺少步数不证明静止；睡眠阶段保留系统原值，不能把躺床或清醒当睡眠。
