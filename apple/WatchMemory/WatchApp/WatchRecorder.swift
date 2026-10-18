@@ -32,6 +32,7 @@ final class WatchRecorder: ObservableObject {
     private var sequence = 0
     private var audioUploadFloor = 0
     private var intent = RecordingIntent()
+    private var recovery = RecordingRecovery()
     private var wanted: Bool { get { intent.wanted } set { intent.wanted = newValue } }
     private var userPaused: Bool { get { intent.userPaused } set { intent.userPaused = newValue } }
     private var diagnostics: RecordingDiagnostics?
@@ -138,12 +139,12 @@ final class WatchRecorder: ObservableObject {
         // Diagnostic history is never an instruction to start a cold microphone.
         publishIntent()
     }
-    @discardableResult private func attemptBegin(trigger: String, manual: Bool) -> Bool {
+    @discardableResult private func attemptBegin(trigger: String, manual: Bool, allowRecovery: Bool = false) -> Bool {
         do {
             if let engine, !engine.isRunning { _ = endEngine(reason: "replace_stopped_engine") }
             try beginEngine(manualProbe: manual)
             guard engine?.isRunning == true else { throw StoreError.invalidState }
-            intent.activationSucceeded(); checkpoint(clean: false, event: "engine_started")
+            recovery.cancel(); intent.activationSucceeded(); checkpoint(clean: false, event: "engine_started")
             publishIntent("正在记录")
             if trigger != "start" { incident(manual ? "manual_resume" : "automatic_resume", outcome: "recovered", fields: ["lastKnownEvent": trigger]) }
             return true
@@ -154,9 +155,36 @@ final class WatchRecorder: ObservableObject {
             else { WatchDirectUploader.shared.setAudioRuntime(nil); try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation) }
             checkpoint(clean: false, event: "activation_failed")
             incident("activation_failed", outcome: "manual", fields: errorFields(error))
+            if allowRecovery, scheduleSystemRecovery(error) { return false }
+            recovery.cancel()
             publishIntent(wanted ? "暂时不能继续录音，已有片段保留；点继续重试" : "录音未能继续，已有片段保留；稍后点开始重试")
             return false
         }
+    }
+    private func scheduleSystemRecovery(_ error: Error) -> Bool {
+        let value = error as NSError
+        guard let ticket = recovery.next(domain: value.domain, code: value.code) else { return false }
+        recordEvent("system_retry_scheduled", ["attempt": String(ticket.attempt), "delay": String(ticket.delay)])
+        publishIntent("系统音频恢复中，已有片段保留")
+        queue.asyncAfter(deadline: .now() + ticket.delay) { [weak self] in
+            guard let self else { return }
+            guard self.recovery.permits(ticket, session: self.sessionID, intent: self.intent,
+                    engineRunning: self.engine?.isRunning ?? false,
+                    batteryLevel: WKInterfaceDevice.current().batteryLevel,
+                    permissionGranted: AVAudioSession.sharedInstance().recordPermission == .granted),
+                  self.intent.authorizeSystemRetry() else {
+                // A stale callback must never cancel a newer recovery episode.
+                self.recordEvent("system_retry_cancelled", ["attempt": String(ticket.attempt)])
+                if self.recovery.owns(ticket) {
+                    self.recovery.cancel(); self.intent.activationFailed()
+                    self.publishIntent("暂时不能继续录音，已有片段保留；点继续重试")
+                }
+                return
+            }
+            self.recordEvent("system_retry_attempt", ["attempt": String(ticket.attempt)])
+            _ = self.attemptBegin(trigger: "system_resume_retry", manual: false, allowRecovery: true)
+        }
+        return true
     }
     func noteScenePhase(_ phase: String) {
         queue.async {
@@ -173,7 +201,7 @@ final class WatchRecorder: ObservableObject {
             if !granted { self.display("请在设置中允许麦克风"); return }
             self.queue.async {
                 guard !self.wanted else { return }
-                self.intent.start(); self.sessionID = UUID(); self.sequence = 0
+                self.recovery.cancel(); self.intent.start(); self.sessionID = UUID(); self.sequence = 0
                 self.sessionStarted = Date(); self.lastPCMAt = nil; self.lastHeartbeatAt = Date(); self.stallReported = false
                 self.recordEvent("start_requested"); self.checkpoint(clean: false, event: "start_requested")
                 _ = self.attemptBegin(trigger: "start", manual: true)
@@ -183,6 +211,7 @@ final class WatchRecorder: ObservableObject {
     func togglePause() {
         queue.async {
             guard self.wanted else { return }
+            self.recovery.cancel()
             if self.engine?.isRunning == true && !self.intent.interruptionActive {
                 self.intent.pause(); let saved = self.endEngine(reason: "user_pause")
                 self.publishIntent(saved ? "已暂停，已有录音会继续同步" : "已暂停，有片段保留待恢复")
@@ -197,7 +226,7 @@ final class WatchRecorder: ObservableObject {
     func stop() {
         queue.async {
             let wasWaiting = self.intent.interruptionActive || self.intent.manualResumeRequired
-            self.recordEvent("stop_requested"); self.intent.stop()
+            self.recovery.cancel(); self.recordEvent("stop_requested"); self.intent.stop()
             let saved = self.endEngine(reason: "user_stop")
             self.checkpoint(clean: saved, event: saved ? "user_stop_complete" : "user_stop_needs_recovery")
             self.recordEvent("session_ended", ["saved": String(saved)])
@@ -413,7 +442,21 @@ final class WatchRecorder: ObservableObject {
                 self.elapsed = (self.store?.all().filter { $0.sessionID == self.sessionID }.reduce(0) { $0 + $1.duration } ?? 0) + Double(self.writtenFrames) / 16000
             }
             if level >= 0 && level < 0.05 && self.wanted {
-                self.wanted = false; self.endEngine(reason: "low_battery"); self.display("电量低于 5%，已保存并停止录音")
+                self.recovery.cancel(); self.intent.stop()
+                let saved = self.endEngine(reason: "low_battery")
+                let stoppedSession = self.sessionID
+                self.display("电量低于 5%，已停止，正在保存片段")
+                // Wait behind tail encoding/fallback and durable manifest finalization.
+                self.encodingQueue.async {
+                    let finalized = RecordingProtectionStop.finalized(saved: saved,
+                        chunks: self.store?.all() ?? [], session: stoppedSession)
+                    self.queue.async {
+                        guard self.sessionID == stoppedSession, !self.wanted else { return }
+                        let result = RecordingProtectionStop.checkpoint(saved: finalized, reason: "low_battery")
+                        self.checkpoint(clean: result.clean, event: result.event)
+                        self.display(finalized ? "电量低于 5%，已保存并停止录音" : "电量低于 5%，已停止；有片段待恢复，请勿卸载")
+                    }
+                }
             }
             if self.wanted, Date().timeIntervalSince(self.lastHeartbeatAt ?? .distantPast) >= 60 {
                 self.lastHeartbeatAt = Date()
@@ -442,15 +485,17 @@ final class WatchRecorder: ObservableObject {
     }
     private func systemInterruptionBegan(fields: [String: String]) {
         recordEvent("audio_interruption", fields.merging(["type": "began", "wanted": String(wanted), "frames": String(writtenFrames)]) { _, b in b })
-        intent.interruptionBegan()
+        recovery.cancel(); intent.interruptionBegan()
         let saved = engine != nil || current != nil ? endEngine(reason: "system_interruption") : true
         if wanted { incident("system_interruption", outcome: "waiting", fields: fields); publishIntent(saved ? "系统正在使用音频，已有片段保存，等待恢复" : "系统正在使用音频，有片段待恢复") }
     }
     private func systemInterruptionEnded(shouldResume: Bool) {
         recordEvent("audio_interruption", ["type": "ended", "shouldResume": String(shouldResume), "wanted": String(wanted)])
         let running = engine?.isRunning ?? false
+        recovery.cancel()
         if intent.interruptionEnded(shouldResume: shouldResume, engineRunning: running) {
-            _ = attemptBegin(trigger: "system_resume", manual: false)
+            recovery.begin(session: sessionID)
+            _ = attemptBegin(trigger: "system_resume", manual: false, allowRecovery: true)
         } else if wanted && !running {
             if userPaused { publishIntent("已由你暂停，点继续可恢复") }
             else { incident("no_resume_hint", outcome: "manual"); publishIntent("系统未建议自动恢复，点继续重试") }
@@ -485,7 +530,7 @@ final class WatchRecorder: ObservableObject {
     }
     @objc private func mediaServicesReset() {
         queue.async {
-            self.recordEvent("media_services_reset")
+            self.recovery.cancel(); self.recordEvent("media_services_reset")
             if self.wanted {
                 self.intent.activationFailed(); _ = self.endEngine(reason: "media_services_reset")
                 self.incident("media_reset", outcome: "manual"); self.publishIntent("音频服务重置，原音保留；点继续恢复")
