@@ -128,4 +128,22 @@ final class PhoneV3Tests: XCTestCase {
         XCTAssertThrowsError(try decode())
     }
 
+    func testDefaultReadingDayAdvancesAtLocalMidnightButHistoryStaysSelected() throws {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = TimeZone(identifier: "Asia/Taipei")!
+        let beforeMidnight = PhoneV3Policy.date("2026-10-18T15:59:00Z")!
+        let afterMidnight = PhoneV3Policy.date("2026-10-18T16:01:00Z")!
+        var selection = PhoneReadingDateSelection(now: beforeMidnight)
+        selection.refresh(now: afterMidnight, calendar: calendar)
+        XCTAssertEqual(calendar.component(.day, from: selection.date), 19)
+        selection.select(beforeMidnight, now: afterMidnight, calendar: calendar)
+        selection.refresh(now: PhoneV3Policy.date("2026-10-19T05:00:00Z")!, calendar: calendar)
+        XCTAssertEqual(calendar.component(.day, from: selection.date), 18)
+        XCTAssertFalse(selection.followsToday)
+        selection.select(afterMidnight, now: afterMidnight, calendar: calendar)
+        selection.refresh(now: PhoneV3Policy.date("2026-10-19T16:01:00Z")!, calendar: calendar)
+        XCTAssertEqual(calendar.component(.day, from: selection.date), 20)
+        XCTAssertTrue(selection.followsToday)
+    }
+
 }

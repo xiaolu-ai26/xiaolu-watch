@@ -1,5 +1,20 @@
 import Foundation
 
+/// Keeps the default Today selection current without replacing a chosen history day.
+public struct PhoneReadingDateSelection: Equatable, Sendable {
+    public private(set) var date: Date
+    public private(set) var followsToday = true
+    public init(now: Date) { date = now }
+    public mutating func select(_ selected: Date, now: Date, calendar: Calendar = .current) {
+        date = selected
+        followsToday = calendar.isDate(selected, inSameDayAs: now)
+    }
+    public mutating func refresh(now: Date, calendar: Calendar = .current) {
+        guard followsToday, !calendar.isDate(date, inSameDayAs: now) else { return }
+        date = now
+    }
+}
+
 public struct PhoneToday: Codable, Sendable {
     public let version: Int; public let date: String; public let timezone: String
     public let generatedAt: String; public let revision: Int

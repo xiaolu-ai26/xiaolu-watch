@@ -9,6 +9,8 @@ final class TodayCoordinator: NSObject, ObservableObject, URLSessionDataDelegate
     @Published private(set) var connected = false
     @Published private(set) var connecting = false
     @Published private(set) var today: PhoneToday?
+    enum ReadingState: Equatable { case idle, loading, ready, failed }
+    @Published private(set) var readingState: ReadingState = .idle
     @Published private(set) var readStatus = "连接处理电脑后查看今天"
     @Published private(set) var healthStatus = "身体背景未启用"
     @Published private(set) var placeStatus = "地点背景未启用"
@@ -158,18 +160,36 @@ final class TodayCoordinator: NSObject, ObservableObject, URLSessionDataDelegate
     @MainActor func load(day: String) async {
         guard PhoneV3Policy.day(day) else { return }
         activeDay = day
-        let generation = UUID(); fetchGeneration = generation; readStatus = "正在读取今天的记录"
+        let generation = UUID(); fetchGeneration = generation; readingState = .loading; readStatus = "正在读取这一天的记录"
+        recordReadingDiagnostic(day: day, phase: "loading")
         do {
             let config = try currentConfiguration()
             let data = try await api.request(base: config.baseURL(), path: "/v3/phone/today", query: [URLQueryItem(name: "date", value: day)], token: config.token)
             let result = try PhoneToday.decode(data, requestedDay: day)
             guard fetchGeneration == generation else { return }
-            today = result; readStatus = "资料更新于 " + shortTime(result.generatedAt); operationError = nil
+            today = result; readingState = .ready; readStatus = "资料更新于 " + shortTime(result.generatedAt); operationError = nil
+            recordReadingDiagnostic(day: day, phase: "ready", responseDay: result.date, cardCount: result.cards.count)
         } catch {
             guard fetchGeneration == generation else { return }
             if today?.date != day { today = nil }
-            readStatus = "暂未取得这一天的记录；不代表没有录音"
+            readingState = .failed; readStatus = "暂未取得这一天的记录；不代表没有录音"
+            let category: String
+            if let failure = error as? PhoneHTTP.Failure, case .status(let status) = failure { category = "http_\(status)" }
+            else if error is DecodingError || error is StoreError { category = "invalid_payload_or_configuration" }
+            else { category = "transport" }
+            recordReadingDiagnostic(day: day, phase: "failed", failure: category)
         }
+    }
+    // Local, overwritten metadata only: no endpoint, credential or recording text.
+    private func recordReadingDiagnostic(day: String, phase: String, responseDay: String? = nil,
+                                         cardCount: Int? = nil, failure: String? = nil) {
+        var value: [String: Any] = ["version": 1, "requested_day": day, "phase": phase,
+                                  "observed_at": PhoneV3Policy.timestamp(Date())]
+        value["response_day"] = responseDay; value["card_count"] = cardCount; value["failure"] = failure
+        guard let directory = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first,
+              let data = try? JSONSerialization.data(withJSONObject: value, options: [.sortedKeys]) else { return }
+        try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        try? data.write(to: directory.appendingPathComponent("reading-status.json"), options: .atomic)
     }
     private func restoreUploads() {
         uploads.getAllTasks { tasks in self.queue.async {

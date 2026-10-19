@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 import WatchMemoryCore
 
 private struct FlowFrameKey: PreferenceKey {
@@ -14,7 +15,8 @@ struct TodayHome: View {
     @State private var systemMotionLimited = ReadingMotionBudget.systemLimited
     @State private var flowVisible = false
     @Namespace private var flow
-    @State private var selectedDate = Date()
+    @State private var dateSelection = PhoneReadingDateSelection(now: Date())
+    private var selectedDate: Date { dateSelection.date }
     @State private var settings = false
     @State private var dates = false
     @State private var hours = false
@@ -25,7 +27,8 @@ struct TodayHome: View {
         let f = DateFormatter(); f.calendar = Calendar(identifier: .gregorian); f.locale = Locale(identifier: "en_US_POSIX")
         f.timeZone = .current; f.dateFormat = "yyyy-MM-dd"; return f.string(from: selectedDate)
     }
-    private var cards: [PhoneToday.Card] { (model.today?.cardsNewestFirst ?? []).filter { $0.id != model.deletionStatus?.cardId } }
+    private var currentToday: PhoneToday? { model.today?.date == day ? model.today : nil }
+    private var cards: [PhoneToday.Card] { (currentToday?.cardsNewestFirst ?? []).filter { $0.id != model.deletionStatus?.cardId } }
     private var visibleCards: [PhoneToday.Card] { showAll ? cards : cards.filter(\.isMainReading) }
     private var featured: PhoneToday.Card? { visibleCards.first }
     var body: some View {
@@ -68,15 +71,15 @@ struct TodayHome: View {
                     .sheet(isPresented: $settings) { TodaySettings() }
                     .sheet(isPresented: $dates) {
                         NavigationStack {
-                            DatePicker("查看日期", selection: $selectedDate, displayedComponents: .date).datePickerStyle(.graphical).padding()
+                            DatePicker("查看日期", selection: Binding(get: { selectedDate }, set: { dateSelection.select($0, now: Date()) }), displayedComponents: .date).datePickerStyle(.graphical).padding()
                                 .navigationTitle("选择日期")
                                 .toolbar { ToolbarItem(placement: .confirmationAction) { Button("完成") { dates = false } } }
                         }.presentationDetents([.medium, .large])
                     }
                     .sheet(isPresented: $hours) {
-                        HourIndex(coverage: model.today?.coverage ?? [], selectedDate: selectedDate) { date in
+                        HourIndex(coverage: currentToday?.coverage ?? [], selectedDate: selectedDate) { date in
                             hours = false
-                            let target = model.today?.card(atOrAfter: date, excluding: model.deletionStatus?.cardId)
+                            let target = currentToday?.card(atOrAfter: date, excluding: model.deletionStatus?.cardId)
                             if let target {
                                 if !target.isMainReading { showAll = true }
                                 Task { @MainActor in
@@ -87,6 +90,11 @@ struct TodayHome: View {
                             }
                         }
                     }
+                    .onChange(of: scenePhase, initial: true) { _, phase in
+                        if phase == .active { dateSelection.refresh(now: Date()) }
+                    }
+                    .onReceive(NotificationCenter.default.publisher(for: .NSCalendarDayChanged)) { _ in dateSelection.refresh(now: Date()) }
+                    .onReceive(NotificationCenter.default.publisher(for: UIApplication.significantTimeChangeNotification)) { _ in dateSelection.refresh(now: Date()) }
                     .onReceive(NotificationCenter.default.publisher(for: ProcessInfo.thermalStateDidChangeNotification)) { _ in systemMotionLimited = ReadingMotionBudget.systemLimited }
                     .task(id: day + (model.connected ? ":connected" : ":waiting") + String(describing: scenePhase)) {
                         guard model.connected, scenePhase == .active else { return }; await model.load(day: day)
@@ -155,22 +163,31 @@ struct TodayHome: View {
                 Text("今日概览").font(.system(.subheadline, design: .serif)).tracking(3)
                 Rectangle().fill(ReadingPalette.quiet.opacity(0.45)).frame(width: 120, height: 0.5)
             }.foregroundStyle(ReadingPalette.ink)
-            if let value = model.today?.overview, !value.text.isEmpty {
+            if let value = currentToday?.overview, !value.text.isEmpty {
                 Text(value.text).font(.system(.title2, design: .serif)).foregroundStyle(ReadingPalette.ink).lineSpacing(7).textSelection(.enabled)
                 if let start = value.coverageStartAt, let end = value.coverageEndAt {
                     Text("内容覆盖 " + clock(start) + "–" + clock(end) + (value.isPartial == true ? " · 部分完成" : ""))
                         .font(.caption).foregroundStyle(ReadingPalette.quiet)
                 } else if value.isPartial == true { Text("已整理部分，后续内容会继续更新").font(.caption).foregroundStyle(ReadingPalette.quiet) }
+            } else if let today = currentToday {
+                Text(today.overview.state == "pending" ? "正在整理这一天的记录。" : "这一天暂时没有日概览。")
+                    .font(.system(.title2, design: .serif)).foregroundStyle(ReadingPalette.quiet)
+                Text(today.cards.isEmpty ? "录音接收与文字处理进度显示在日期上方。" : "已有记录可以在下方展开阅读全文。")
+                    .font(.caption).foregroundStyle(ReadingPalette.quiet)
             } else {
-                Text("正在整理这一天的记录。").font(.system(.title2, design: .serif)).foregroundStyle(ReadingPalette.quiet)
-                Text("已完成的片段可以先阅读全文。").font(.caption).foregroundStyle(ReadingPalette.quiet)
+                Text(model.readingState == .failed ? "暂时无法读取这一天的记录。" : "正在读取这一天的记录。")
+                    .font(.system(.title2, design: .serif)).foregroundStyle(ReadingPalette.quiet)
+                if model.readingState == .failed {
+                    Text("这不代表没有录音，可以下拉刷新重试。")
+                        .font(.caption).foregroundStyle(ReadingPalette.quiet)
+                }
             }
         }
     }
     private var bodyContext: some View {
         DisclosureGroup(isExpanded: $bodyExpanded) {
             VStack(alignment: .leading, spacing: 12) {
-                if let value = model.today?.body {
+                if let value = currentToday?.body {
                     ForEach(Array(value.lines.enumerated()), id: \.offset) { _, line in Text(line).font(.callout).lineSpacing(4) }
                     Text("参考 \(value.sampleCount) 条样本 · 生理信号估计").font(.caption)
                 }
@@ -178,14 +195,14 @@ struct TodayHome: View {
             }.foregroundStyle(ReadingPalette.quiet).padding(.top, 16)
         } label: {
             VStack(alignment: .leading, spacing: 5) {
-                Text("身体背景 · " + (model.today?.body.measuredThroughAt.map { "测量截至" + clock($0) } ?? "测量时间待同步"))
+                Text("身体背景 · " + (currentToday?.body.measuredThroughAt.map { "测量截至" + clock($0) } ?? "测量时间待同步"))
                     .font(.caption).foregroundStyle(ReadingPalette.quiet)
-                if model.today?.body.state == "unknown" { Text("数据不足，暂不判断").font(.caption).foregroundStyle(ReadingPalette.quiet) }
+                if currentToday?.body.state == "unknown" { Text("数据不足，暂不判断").font(.caption).foregroundStyle(ReadingPalette.quiet) }
             }
         }.tint(ReadingPalette.quiet)
     }
     private var ingestionHeadline: String {
-        guard let ingestion = model.today?.ingestion else { return "录音状态待同步" }
+        guard let ingestion = currentToday?.ingestion else { return "录音状态待同步" }
         guard let latest = ingestion.latestRecordedAt else {
             return ingestion.state == "empty" ? "当天尚未收到录音" : "录音状态待同步"
         }
@@ -199,7 +216,7 @@ struct TodayHome: View {
             HStack(alignment: .top, spacing: 8) {
                 Image(systemName: "waveform").padding(.top, 2)
                 VStack(alignment: .leading, spacing: 5) {
-                    if let ingestion = model.today?.ingestion {
+                    if let ingestion = currentToday?.ingestion {
                         Text(ingestion.latestRecordedAt.map { "最新录到 " + clock($0) }
                              ?? (ingestion.state == "empty" ? "当天尚未收到录音" : "录音状态待同步"))
                         Text("转写至 " + (ingestion.latestTranscribedAt.map(clock) ?? "待同步")

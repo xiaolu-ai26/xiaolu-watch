@@ -7,6 +7,17 @@ import UIKit
 import AppKit
 #endif
 
+private enum FlowDiagnostics {
+    static func write(_ value: [String: Any]) {
+        var record = value
+        record["version"] = 1; record["observed_at"] = Date().timeIntervalSince1970
+        guard let directory = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first,
+              let data = try? JSONSerialization.data(withJSONObject: record) else { return }
+        try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        try? data.write(to: directory.appendingPathComponent("reading-flow-status.json"), options: .atomic)
+    }
+}
+
 struct EditorialFlowUniforms {
     var viewport: SIMD2<Float>
     var time: Float
@@ -27,6 +38,7 @@ final class EditorialFlowRenderer: NSObject, MTKViewDelegate {
     private var staticSize: CGSize = .zero
     private var elapsed: CFTimeInterval = 0
     private var lastDraw: CFTimeInterval?
+    private var didScheduleFirstCommandDiagnostic = false
     private(set) var presentedFrames = 0
     private(set) var frameIntervals: [Double] = []
     init(device: MTLDevice, densityURL: URL? = Bundle.main.url(forResource: "EditorialFlowDensity", withExtension: "png")) throws {
@@ -51,6 +63,13 @@ final class EditorialFlowRenderer: NSObject, MTKViewDelegate {
         fieldPipeline = try device.makeRenderPipelineState(descriptor: descriptor)
         super.init()
     }
+    private func recordDiagnostic(_ phase: String, size: CGSize, commandStatus: Int? = nil) {
+        var value: [String: Any] = ["version": 1, "phase": phase, "render_allowed": renderAllowed,
+            "animating": animating, "width": size.width, "height": size.height,
+            "presented_frames": presentedFrames, "observed_at": Date().timeIntervalSince1970]
+        value["command_status"] = commandStatus
+        FlowDiagnostics.write(value)
+    }
     func configure(_ view: MTKView, animate: Bool, renderAllowed: Bool) {
         let wasAllowed = self.renderAllowed, wasAnimating = animating
         self.renderAllowed = renderAllowed
@@ -63,6 +82,7 @@ final class EditorialFlowRenderer: NSObject, MTKViewDelegate {
         if animating != wasAnimating || renderAllowed != wasAllowed { lastDraw = nil }
         view.isPaused = !animating
         view.enableSetNeedsDisplay = renderAllowed && !animating
+        if wasAllowed != renderAllowed || wasAnimating != animating { recordDiagnostic("configured", size: view.drawableSize) }
         guard renderAllowed else { return }
         if animating { staticFrameValid = false }
         else if !staticFrameValid || !wasAllowed || wasAnimating || staticSize != view.drawableSize { view.draw() }
@@ -95,7 +115,16 @@ final class EditorialFlowRenderer: NSObject, MTKViewDelegate {
         }
         lastDraw = now
         encode(encoder, size: view.drawableSize, time: Float(elapsed))
-        encoder.endEncoding(); buffer.present(drawable); buffer.commit()
+        encoder.endEncoding()
+        if !didScheduleFirstCommandDiagnostic {
+            didScheduleFirstCommandDiagnostic = true
+            let size = view.drawableSize
+            buffer.addCompletedHandler { [weak self] completed in
+                let status = completed.status.rawValue
+                DispatchQueue.main.async { self?.recordDiagnostic("first_command_completed", size: size, commandStatus: Int(status)) }
+            }
+        }
+        buffer.present(drawable); buffer.commit()
         presentedFrames += 1
         if !animating { staticFrameValid = true; staticSize = view.drawableSize }
     }
@@ -108,7 +137,15 @@ final class EditorialFlowRenderer: NSObject, MTKViewDelegate {
     func prepareIfAllowed(_ allowed: Bool) {
         // Even texture/mipmap initialization is deferred until the page is renderable.
         guard allowed && !attempted else { return }; attempted = true
-        if let device = MTLCreateSystemDefaultDevice() { renderer = try? EditorialFlowRenderer(device: device) }
+        guard let device = MTLCreateSystemDefaultDevice() else {
+            FlowDiagnostics.write(["phase": "init_failed", "reason": "device_unavailable"]); return
+        }
+        do {
+            renderer = try EditorialFlowRenderer(device: device)
+            FlowDiagnostics.write(["phase": "initialized"])
+        } catch {
+            FlowDiagnostics.write(["phase": "init_failed", "error_domain": (error as NSError).domain, "error_code": (error as NSError).code])
+        }
     }
 }
 
